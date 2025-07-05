@@ -7,8 +7,8 @@ clear; clc;
 run('simple_stair_perception.m');
 
 % Initialize the tomogram processor with fine resolution
-ds = 0.10;  % 10cm slice interval
-rg = 0.05; % 5cm grid resolution
+ds = 0.2;  % 10cm slice interval
+rg = 0.2; % 5cm grid resolution
 processor = TomogramProcessor(ds, rg);
 
 % Load the point cloud

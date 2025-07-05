@@ -32,19 +32,19 @@ classdef TomogramProcessor < handle
             end
             
             % Initialize parameters for traversability estimation
-            obj.robotParams.d_min = 0.3;    % Minimum robot height
-            obj.robotParams.d_ref = 0.40;    % Reference (normal) robot height
+            obj.robotParams.d_min = 0.2;    % Minimum robot height
+            obj.robotParams.d_ref = 0.50;    % Reference (normal) robot height
             
             obj.costParams.c_B = 50;        % Barrier/obstacle cost
             obj.costParams.alpha_d = 5;     % Height adjustment cost factor
-            obj.costParams.theta_b = 20;   % Obstacle boundary threshold
-            obj.costParams.theta_s = 10;   % Flat surface threshold
-            obj.costParams.theta_p = 0.4;   % Safe neighbor ratio threshold (increased from 0.2)
+            obj.costParams.theta_b = 1.5;   % Obstacle boundary threshold
+            obj.costParams.theta_s = 0.2;   % Flat surface threshold
+            obj.costParams.theta_p = 0.5;   % Safe neighbor ratio threshold (increased from 0.2)
             obj.costParams.alpha_s = 0.5;     % Surface cost factor
             obj.costParams.alpha_b = 1;     % Boundary cost factor (decreased from 2)
             obj.costParams.r_g = 0.15;       % Grid resolution
-            obj.costParams.d_inf = 0.4;     % Inflation distance
-            obj.costParams.d_sm = 0.4;      % Safety margin
+            obj.costParams.d_inf = 0.2;     % Inflation distance
+            obj.costParams.d_sm = 0.2;      % Safety margin
             
             % Initialize coordinate bounds (will be updated in processPointCloud)
             obj.minX = inf;
@@ -80,6 +80,19 @@ classdef TomogramProcessor < handle
             % Process point cloud into tomogram slices
             obj.slices = cell(obj.N+1, 1);
             
+            fprintf('\nProcessing Tomograms:\n');
+            fprintf('Grid resolution: %.3f m\n', obj.rg);
+            fprintf('Slice interval: %.3f m\n', obj.ds);
+            fprintf('Robot parameters:\n');
+            fprintf('  Minimum height (d_min): %.2f m\n', obj.robotParams.d_min);
+            fprintf('  Reference height (d_ref): %.2f m\n', obj.robotParams.d_ref);
+            fprintf('Cost parameters:\n');
+            fprintf('  Barrier cost (c_B): %.1f\n', obj.costParams.c_B);
+            fprintf('  Boundary threshold (theta_b): %.1f\n', obj.costParams.theta_b);
+            fprintf('  Surface threshold (theta_s): %.1f\n', obj.costParams.theta_s);
+            fprintf('  Safe neighbor ratio (theta_p): %.2f\n', obj.costParams.theta_p);
+            fprintf('\nProcessing slices...\n');
+            
             % Process each slice
             for k = 0:obj.N
                 plane_z = obj.zMin + k * obj.ds;
@@ -113,20 +126,17 @@ classdef TomogramProcessor < handle
                 
                 % Step 1: Calculate height interval cost
                 dI = eC - eG;  % Height interval
-                dI(isnan(dI)) = obj.costParams.c_B;  % Mark invalid regions as obstacles
+                validDI = dI(~isnan(dI));
                 
                 % Calculate height-based cost
                 cI = zeros(size(dI));
+                cI(isnan(dI)) = obj.costParams.c_B;  % Mark invalid regions as obstacles
                 cI(dI < obj.robotParams.d_min) = obj.costParams.c_B;  % Too low to pass
                 adjustable = dI >= obj.robotParams.d_min & dI <= obj.robotParams.d_ref;
                 cI(adjustable) = max(0, obj.costParams.alpha_d * (obj.robotParams.d_ref - dI(adjustable)));
                 
                 % Step 2: Analyze ground conditions
                 [rows, cols] = size(eG);
-                
-                % Calculate physical distances between grid points
-                dx = obj.rg;  % Grid resolution in x direction
-                dy = obj.rg;  % Grid resolution in y direction
                 
                 % Calculate gradients using physical distances
                 gx = zeros(size(eG));
@@ -135,24 +145,18 @@ classdef TomogramProcessor < handle
                 % X direction gradient (using central difference)
                 for i = 1:rows
                     for j = 2:cols-1
-                        gx(i,j) = (eG(i,j+1) - eG(i,j-1)) / (2*dx);
-                    end
-                    % Forward/backward difference at boundaries
-                    if cols > 1
-                        gx(i,1) = (eG(i,2) - eG(i,1)) / dx;
-                        gx(i,cols) = (eG(i,cols) - eG(i,cols-1)) / dx;
+                        if ~isnan(eG(i,j+1)) && ~isnan(eG(i,j-1))
+                            gx(i,j) = (eG(i,j+1) - eG(i,j-1)) / (2*obj.rg);
+                        end
                     end
                 end
                 
                 % Y direction gradient (using central difference)
                 for j = 1:cols
                     for i = 2:rows-1
-                        gy(i,j) = (eG(i+1,j) - eG(i-1,j)) / (2*dy);
-                    end
-                    % Forward/backward difference at boundaries
-                    if rows > 1
-                        gy(1,j) = (eG(2,j) - eG(1,j)) / dy;
-                        gy(rows,j) = (eG(rows,j) - eG(rows-1,j)) / dy;
+                        if ~isnan(eG(i+1,j)) && ~isnan(eG(i-1,j))
+                            gy(i,j) = (eG(i+1,j) - eG(i-1,j)) / (2*obj.rg);
+                        end
                     end
                 end
                 
@@ -162,41 +166,78 @@ classdef TomogramProcessor < handle
                 
                 % Calculate ground-based cost
                 cG = zeros(size(eG));
+                cG(isnan(eG)) = obj.costParams.c_B;  % Mark invalid regions as obstacles
                 
-                % For each grid cell
+                % For each valid grid cell
                 for i = 2:rows-1
                     for j = 2:cols-1
-                        % Get 3x3 neighborhood
-                        patch = mgrad(i-1:i+1, j-1:j+1);
-                        % Calculate ps: proportion of neighboring grids with m^grad < theta_s
-                        ps = sum(patch(:) < obj.costParams.theta_s) / numel(patch);
-                        
-                        % Strictly follow formula (4)
-                        if ps > obj.costParams.theta_p
-                            % If enough neighbors are smooth, use the boundary cost formula
-                            cG(i,j) = obj.costParams.alpha_b * (mxy(i,j) / obj.costParams.theta_b)^2;
-                        else
-                            % Otherwise, mark as barrier
-                            cG(i,j) = obj.costParams.c_B;
+                        if ~isnan(eG(i,j))
+                            if mgrad(i,j) < obj.costParams.theta_s
+                                % Flat surface cost
+                                cG(i,j) = obj.costParams.alpha_s * (mgrad(i,j) / obj.costParams.theta_s^2);
+                            else
+                                % Get 3x3 neighborhood
+                                patch = mgrad(i-1:i+1, j-1:j+1);
+                                valid_patch = ~isnan(patch);
+                                if any(valid_patch(:))
+                                    % Calculate ps: proportion of neighboring grids with m^grad < theta_s
+                                    ps = sum(patch(:) < obj.costParams.theta_s & valid_patch(:)) / sum(valid_patch(:));
+                                    
+                                    if mxy(i,j) > obj.costParams.theta_b
+                                        cG(i,j) = obj.costParams.c_B;  % Obstacle boundary
+                                    elseif ps > obj.costParams.theta_p
+                                        % Safe step/ramp
+                                        cG(i,j) = obj.costParams.alpha_b * (mxy(i,j) / obj.costParams.theta_b^2);
+                                    else
+                                        cG(i,j) = obj.costParams.c_B;  % Unsafe region
+                                    end
+                                else
+                                    cG(i,j) = obj.costParams.c_B;
+                                end
+                            end
                         end
                     end
                 end
                 
-                % Mark edges as barriers
-                cG(1,:) = obj.costParams.c_B;
-                cG(end,:) = obj.costParams.c_B;
-                cG(:,1) = obj.costParams.c_B;
-                cG(:,end) = obj.costParams.c_B;
-                
-                % Step 3: Combine costs and apply inflation
+                % Step 3: Combine costs
                 cinit = min(obj.costParams.c_B, cI + cG);
+                
+                % Print statistics for key slices
+                fprintf('\n=== Slice %d/%d (z=%.2fm) ===\n', k, obj.N, plane_z);
+                
+                % Height interval statistics
+                if ~isempty(validDI)
+                    fprintf('Height Interval (dI):\n');
+                    fprintf('  Mean: %.2f m, Max: %.2f m, Min: %.2f m\n', ...
+                        mean(validDI), ...
+                        max(validDI), ...
+                        min(validDI));
+                end
+                
+                % Gradient statistics
+                valid_mgrad = mgrad(~isnan(mgrad));
+                if ~isempty(valid_mgrad)
+                    fprintf('Ground Gradients:\n');
+                    fprintf('  Mean mgrad: %.2f, Max mxy: %.2f\n', ...
+                        mean(valid_mgrad), max(mxy(:)));
+                end
+                
+                % Cost statistics
+                valid_cinit = cinit(~isnan(cinit));
+                if ~isempty(valid_cinit)
+                    traversable = sum(valid_cinit < obj.costParams.c_B);
+                    total = numel(valid_cinit);
+                    fprintf('Traversability:\n');
+                    fprintf('  Traversable cells: %d (%.1f%%)\n', ...
+                        traversable, 100 * traversable / total);
+                end
                 
                 % Create inflation kernel
                 kernel_size = 5;
                 [X, Y] = meshgrid(-2:2, -2:2);
                 dist = sqrt(X.^2 + Y.^2) * obj.costParams.r_g;
-                K = max(0, min(1 - (dist - obj.costParams.d_inf) / (obj.costParams.d_sm - obj.costParams.r_g), 1));
-                K = K / max(K(:));  % Normalize kernel
+                K = max(0, min(1 - (dist - obj.costParams.d_inf) / ...
+                    (obj.costParams.d_sm - obj.costParams.r_g), 1));
                 
                 % Apply inflation using sliding window
                 cT = zeros(size(cinit));
@@ -209,21 +250,36 @@ classdef TomogramProcessor < handle
                 
                 % Store slice data
                 slice.z = plane_z;
-                slice.eG = eG;  % Now storing absolute heights
-                slice.eC = eC;  % Now storing absolute heights
+                slice.eG = eG;
+                slice.eC = eC;
                 slice.cT = cT;
+                slice.cI = cI;
+                slice.cG = cG;
                 obj.slices{k+1} = slice;
             end
             
-            % Remove empty slices
+            % Remove empty slices and print summary
             valid_slices = false(length(obj.slices), 1);
+            total_traversable = 0;
+            total_cells = 0;
+            
             for k = 1:length(obj.slices)
                 if ~all(isnan(obj.slices{k}.eG(:))) || ~all(isnan(obj.slices{k}.eC(:)))
                     valid_slices(k) = true;
+                    valid_costs = obj.slices{k}.cT(~isnan(obj.slices{k}.cT));
+                    total_traversable = total_traversable + sum(valid_costs < obj.costParams.c_B);
+                    total_cells = total_cells + numel(valid_costs);
                 end
             end
+            
             obj.slices = obj.slices(valid_slices);
             obj.N = length(obj.slices) - 1;
+            
+            fprintf('\nFinal Statistics:\n');
+            fprintf('Valid slices: %d\n', obj.N + 1);
+            fprintf('Overall traversability: %.1f%% (%d/%d cells)\n', ...
+                100 * total_traversable / total_cells, ...
+                total_traversable, total_cells);
         end
         
         function visualizeSlices(obj)
@@ -251,7 +307,7 @@ classdef TomogramProcessor < handle
                 
                 if any(ground_valid(:))
                     % Calculate traversability with strict threshold
-                    traversable = ground_valid & (slice.cT < obj.costParams.c_B * 0.5);
+                    traversable = ground_valid & (slice.cT < obj.costParams.c_B);
                     blocked = ground_valid & (~traversable);
                     
                     % Plot traversable areas
