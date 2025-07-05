@@ -6,9 +6,9 @@ clear; clc;
 
 % --- Parameters (edit freely) ---
 STEP_W  = 1.0;   % step width   (m)
-STEP_H  = 0.15;  % step height  (m)
+STEP_H  = 0.20;  % step height  (m)
 STEP_D  = 0.30;  % step depth   (m)
-N       = 4;     % number of steps up (and down)
+N       = 6;     % number of steps up (and down)
 NOISE   = 0.005; % std-dev Gaussian noise (m) - reduced for better analysis
 PTS_TOT = 5e4;   % total points to sample - increased for better density
 

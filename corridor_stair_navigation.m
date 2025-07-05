@@ -147,11 +147,22 @@ ROBOT_CLEARANCE = 0.5; % Preferred clearance (d_ref parameter)
 %% PCT ALGORITHM IMPLEMENTATION
 fprintf('=== PCT (Point Cloud Tomography) Navigation System ===\n');
 
-% Initialize robot and cost parameters
-robot_params = struct('d_min', ROBOT_HEIGHT, 'd_ref', ROBOT_CLEARANCE, ...
-                     'd_inf', 0.3, 'd_sm', 0.5, 'rg', GRID_RES);
-cost_params = struct('c_B', 1000, 'alpha_d', 10, 'alpha_s', 5, ...
-                    'theta_b', 0.5, 'theta_s', 0.2, 'theta_p', 0.7);
+% Initialize robot and cost parameters according to paper
+robot_params = struct(...
+    'd_min', ROBOT_HEIGHT, ...    % Minimum robot height
+    'd_ref', ROBOT_CLEARANCE, ... % Reference (normal) robot height
+    'd_inf', 0.2, ...            % Inflation distance
+    'd_sm', 0.2, ...             % Safety margin for gateway transitions
+    'rg', GRID_RES);             % Grid resolution
+
+cost_params = struct(...
+    'c_B', 100, ...              % Barrier/obstacle cost
+    'alpha_d', 5, ...            % Height adjustment cost factor
+    'alpha_s', 0.5, ...          % Surface cost factor
+    'alpha_b', 1.0, ...          % Boundary cost factor
+    'theta_b', 1.5, ...          % Obstacle boundary threshold
+    'theta_s', 0.2, ...          % Flat surface threshold
+    'theta_p', 0.5);             % Safe neighbor ratio threshold
 
 % Step 1: Build Tomogram
 fprintf('Step 1: Building tomogram with %.2fm slice separation...\n', SLICE_HEIGHT);
@@ -455,7 +466,14 @@ function tomogram = estimatePCTTraversability(tomogram, robotParams, costParams,
         centerY = w/2;
         [X, Y] = meshgrid(1:w, 1:h);  % 注意这里交换了顺序，使Y的维度与c_T匹配
         centerDist = abs(Y - centerY) * tomogram.gridRes;
-        c_T = c_T + centerDist * 0.1;  % Small cost increase with distance from center
+        
+        % 增加边缘惩罚而不是中心奖励
+        edgePenalty = (centerDist / (w/4 * tomogram.gridRes)).^2;  % 使用二次函数增加边缘成本
+        edgePenalty = edgePenalty * costParams.c_B * 0.5;  % 边缘的惩罚最大为障碍成本的一半
+        c_T = c_T + edgePenalty;
+        
+        % 确保不会超过障碍成本
+        c_T = min(c_T, costParams.c_B);
         
         % Store traversability cost
         tomogram.slices{k}.c_T = c_T;

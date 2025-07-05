@@ -96,15 +96,10 @@ classdef TomogramProcessor < handle
             % Process each slice
             for k = 0:obj.N
                 plane_z = obj.zMin + k * obj.ds;
-                fprintf('\n=== Slice %d/%d (z=%.2fm) ===\n', k, obj.N, plane_z);
                 
                 % Initialize height maps
                 eG = nan(obj.gridSize);  % Ground height map
                 eC = nan(obj.gridSize);  % Ceiling height map
-                
-                % Initialize point counters
-                numPointsAbove = 0;
-                numPointsBelow = 0;
                 
                 % Process points for this slice
                 for u = 1:size(obj.pointCloud, 1)
@@ -120,35 +115,17 @@ classdef TomogramProcessor < handle
                         % Update ground height (store absolute height)
                         if isnan(eG(i,j)) || z < eG(i,j)
                             eG(i,j) = z;
-                            numPointsAbove = numPointsAbove + 1;
                         end
                     else
                         % Update ceiling height (store absolute height)
                         if isnan(eC(i,j)) || z > eC(i,j)
                             eC(i,j) = z;
-                            numPointsBelow = numPointsBelow + 1;
                         end
                     end
                 end
                 
-                % Print point statistics
-                fprintf('Point Distribution:\n');
-                fprintf('  Points above slice: %d\n', numPointsAbove);
-                fprintf('  Points below slice: %d\n', numPointsBelow);
-                fprintf('  Valid ground cells: %d\n', sum(~isnan(eG(:))));
-                fprintf('  Valid ceiling cells: %d\n', sum(~isnan(eC(:))));
-                
                 % Step 1: Calculate height interval cost
                 dI = eC - eG;  % Height interval
-                fprintf('Height Interval (dI):\n');
-                validDI = dI(~isnan(dI));
-                if ~isempty(validDI)
-                    fprintf('  Min: %.2fm, Max: %.2fm, Mean: %.2fm\n', ...
-                        min(validDI(:)), max(validDI(:)), mean(validDI(:)));
-                    fprintf('  Valid measurements: %d\n', numel(validDI));
-                else
-                    fprintf('  No valid measurements\n');
-                end
                 
                 % Calculate height-based cost
                 cI = zeros(size(dI));
@@ -156,11 +133,6 @@ classdef TomogramProcessor < handle
                 cI(dI < obj.robotParams.d_min) = obj.costParams.c_B;  % Too low to pass
                 adjustable = dI >= obj.robotParams.d_min & dI <= obj.robotParams.d_ref;
                 cI(adjustable) = max(0, obj.costParams.alpha_d * (obj.robotParams.d_ref - dI(adjustable)));
-                
-                % Print cost statistics
-                fprintf('Cost Statistics:\n');
-                fprintf('  Cells marked as obstacles: %d\n', sum(cI(:) >= obj.costParams.c_B));
-                fprintf('  Adjustable height cells: %d\n', sum(adjustable(:)));
                 
                 % Step 2: Analyze ground conditions
                 [rows, cols] = size(eG);
@@ -190,20 +162,6 @@ classdef TomogramProcessor < handle
                 % Calculate gradient metrics
                 mxy = max(abs(gx), abs(gy));  % Maximum directional gradient
                 mgrad = sqrt(gx.^2 + gy.^2);  % Total gradient magnitude
-                
-                % Print gradient statistics
-                fprintf('Ground Gradients:\n');
-                validGrad = mgrad(~isnan(mgrad));
-                if ~isempty(validGrad)
-                    fprintf('  Mean mgrad: %.2f, Max mxy: %.2f\n', ...
-                        mean(validGrad(:)), max(mxy(:)));
-                    fprintf('  Cells with gradient < theta_s: %d\n', ...
-                        sum(validGrad < obj.costParams.theta_s));
-                    fprintf('  Cells with gradient > theta_b: %d\n', ...
-                        sum(mxy(:) > obj.costParams.theta_b));
-                else
-                    fprintf('  No valid gradient measurements\n');
-                end
                 
                 % Calculate ground-based cost
                 cG = zeros(size(eG));
@@ -244,16 +202,16 @@ classdef TomogramProcessor < handle
                 cinit = min(obj.costParams.c_B, cI + cG);
                 
                 % Add center line preference
-                % [rows, cols] = size(cinit);
-                % centerX = cols/2;
-                % [X, Y] = meshgrid(1:cols, 1:rows);
-                % centerDist = abs(X - centerX) * obj.rg;
+                [rows, cols] = size(cinit);
+                centerX = cols/2;
+                [X, Y] = meshgrid(1:cols, 1:rows);
+                centerDist = abs(X - centerX) * obj.rg;
                 
                 % 使用二次函数增加边缘成本
-                % edgePenalty = (centerDist / (cols/4 * obj.rg)).^2;  % 使用二次函数
-                % edgePenalty = edgePenalty * obj.costParams.c_B * 0.3;  % 边缘惩罚最大为障碍成本的30%
-                % cinit = cinit + edgePenalty;
-                % cinit = min(cinit, obj.costParams.c_B);  % 确保不超过障碍成本
+                edgePenalty = (centerDist / (cols/4 * obj.rg)).^2;  % 使用二次函数
+                edgePenalty = edgePenalty * obj.costParams.c_B * 0.3;  % 边缘惩罚最大为障碍成本的30%
+                cinit = cinit + edgePenalty;
+                cinit = min(cinit, obj.costParams.c_B);  % 确保不超过障碍成本
                 
                 % Print statistics for key slices
                 if mod(k, 5) == 0 || k == 0 || k == obj.N
@@ -329,7 +287,7 @@ classdef TomogramProcessor < handle
             % Simplify tomogram slices by removing redundant ones
             % Parameters for simplification
             threshold_height = 0.01;  % 高度变化阈值 (m)
-            threshold_cost = -0.1;      % 成本降低阈值
+            threshold_cost = -1;      % 成本降低阈值
             
             % 记录原始切片数
             original_count = length(obj.slices);
