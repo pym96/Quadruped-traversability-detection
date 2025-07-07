@@ -32,23 +32,23 @@ classdef TomogramProcessor < handle
             end
             
             % Initialize parameters for traversability estimation
-            obj.robotParams.d_min = 0.25;    % Minimum robot height
-            obj.robotParams.d_ref = 0.50;    % Reference (normal) robot height
+            obj.robotParams.d_min = 0.15;    % Minimum robot height (reduced for quadruped)
+            obj.robotParams.d_ref = 0.40;    % Reference (normal) robot height (reduced)
             % Safety margin for vertical transitions
-            obj.robotParams.d_sm = 0.2;      % Same as costParams.d_sm
+            obj.robotParams.d_sm = 0.3;      % Increased for better stair climbing
             % Maximum acceptable ground slope (same as theta_s threshold)
-            obj.robotParams.theta_max = 0.5;
+            obj.robotParams.theta_max = 1.0; % Increased slope tolerance
             
-            obj.costParams.c_B = 50;        % Barrier/obstacle cost
-            obj.costParams.alpha_d = 0.5;     % Height adjustment cost factor
-            obj.costParams.theta_b = 10;   % Obstacle boundary threshold
-            obj.costParams.theta_s = 0.7;   % Flat surface threshold
-            obj.costParams.theta_p = 0.3;   % Safe neighbor ratio threshold
-            obj.costParams.alpha_s = 0.1;   % Surface cost factor
-            obj.costParams.alpha_b = 0.1;     % Boundary cost factor
-            obj.costParams.r_g = 0.15;      % Grid resolution
-            obj.costParams.d_inf = 0.2;     % Inflation distance
-            obj.costParams.d_sm = 0.2;      % Safety margin
+            obj.costParams.c_B = 120;        % Barrier/obstacle cost (increased to be more selective)
+            obj.costParams.alpha_d = 0.2;    % Height adjustment cost factor (reduced)
+            obj.costParams.theta_b = 15;     % Obstacle boundary threshold (increased)
+            obj.costParams.theta_s = 1.0;    % Flat surface threshold (increased for slope tolerance)
+            obj.costParams.theta_p = 0.1;    % Safe neighbor ratio threshold (reduced for more permissive)
+            obj.costParams.alpha_s = 0.05;   % Surface cost factor (reduced)
+            obj.costParams.alpha_b = 0.05;   % Boundary cost factor (reduced)
+            obj.costParams.r_g = 0.15;       % Grid resolution
+            obj.costParams.d_inf = 0.2;      % Inflation distance
+            obj.costParams.d_sm = 0.3;       % Safety margin (matched with robot params)
             
             % Initialize coordinate bounds (will be updated in processPointCloud)
             obj.minX = inf;
@@ -62,9 +62,10 @@ classdef TomogramProcessor < handle
         function obj = loadPointCloud(obj, points)
             % Load point cloud data and initialize parameters
             obj.pointCloud = points;
-            obj.zMin = min(points(:,3));
+            rawZmin = min(points(:,3));
+            obj.zMin = floor(rawZmin / obj.ds) * obj.ds - obj.ds/2;  % align to nearest slice plane
             obj.zMax = max(points(:,3));
-            obj.N = ceil((obj.zMax - obj.zMin) / obj.ds);
+            obj.N = ceil((obj.zMax - obj.zMin) / obj.ds);  % number of slices
             
             % Calculate grid size based on point cloud bounds
             xMax = max(points(:,1)); xMin = min(points(:,1));
@@ -258,6 +259,9 @@ classdef TomogramProcessor < handle
             
             % Remove invalid slices
             obj.removeInvalidSlices();
+            
+            % Plot cost trends
+            obj.plotCostTrends();
         end
         
         function visualizeSlice(obj, k)
@@ -339,8 +343,26 @@ classdef TomogramProcessor < handle
 
             [cG, gx, gy, mxy] = obj.calculateGroundCost(slice.eG);
 
-            cInit = 0.6 * cG;
+            maskHigh = slice.dI > obj.robotParams.d_ref;
+            cI(maskHigh) = 0;                 % 净空充足 → 0
+            % Fuse costs: if either component hits barrier, keep barrier;
+            % otherwise take weighted sum favouring ground cost.
+            cInit = max(cI, 0.5*cI + 0.5*cG);
             cT = min(obj.costParams.c_B, cInit);
+
+            % -----------------------------------------------------------------
+            % Additional invalidation: if the ground that supports this slice
+            % is farther than half a slice below the current plane, the robot
+            % cannot actually stand here.  Mark these cells invalid (NaN) so
+            % they will neither be considered traversable nor be rendered
+            % as blue patches in the visualization.
+            % -----------------------------------------------------------------
+            supportMap = slice.z - slice.eG;          % vertical distance to ground
+            farSupportMask = supportMap > 0.8*obj.ds;    % out of supporting range
+            cT(farSupportMask) = NaN;
+            cI(farSupportMask) = NaN;
+            cG(farSupportMask) = NaN;
+            cInit(farSupportMask) = NaN;
         end
         
         function [cG, gx, gy, mxy] = calculateGroundCost(obj, eG)
@@ -428,68 +450,113 @@ classdef TomogramProcessor < handle
         end
         
         function obj = simplifyTomograms(obj)
-            % Simplify tomogram slices by removing redundant ones
-            % Parameters for simplification
-            threshold_height = 0.01;  % 高度变化阈值 (m)
-            threshold_cost = -0.1;      % 成本降低阈值
+            % Simplify tomogram slices according to PCT paper Algorithm 1 (lines 9-11)
+            % The principle: If Mk ⊆ (Mk-1 ∪ Mk+1), then slice Sk is redundant
+            % where Mk denotes the set containing all traversable grids in slice Sk
             
-            % 记录原始切片数
+            fprintf('\n=== Tomogram Simplification ===\n');
+            fprintf('Following PCT paper Algorithm 1 principle:\n');
+            fprintf('Remove slice k if Mk ⊆ (Mk-1 ∪ Mk+1)\n');
+            
             original_count = length(obj.slices);
-            valid_slices = true(original_count, 1);
+            fprintf('Original slices: %d\n', original_count);
             
-            % 遍历所有中间切片（保留首尾切片）
-            for k = 2:length(obj.slices)-1
-                current_slice = obj.slices{k};
-                prev_slice = obj.slices{k-1};
-                next_slice = obj.slices{k+1};
-                
-                % 1. 找出当前切片的可通行网格
-                Mk = current_slice.cT < obj.costParams.c_B;
-                Mk_prev = prev_slice.cT < obj.costParams.c_B;
-                Mk_next = next_slice.cT < obj.costParams.c_B;
-                
-                % 2. 检查是否存在唯一网格
-                [rows, cols] = size(current_slice.cT);
-                has_unique_grid = false;
-                
-                for i = 1:rows
-                    for j = 1:cols
-                        if ~Mk(i,j)
-                            continue;  % 跳过不可通行网格
-                        end
-                        
-                        % 检查高度和成本的唯一性（Eq. 8 和 Eq. 9）
-                        height_unique_prev = (current_slice.eG(i,j) - prev_slice.eG(i,j)) > threshold_height;
-                        height_unique_next = (next_slice.eG(i,j) - current_slice.eG(i,j)) > threshold_height;
-                        
-                        cost_unique_prev = current_slice.cT(i,j) < (prev_slice.cT(i,j) + threshold_cost);
-                        cost_unique_next = current_slice.cT(i,j) < (next_slice.cT(i,j) + threshold_cost);
-                        
-                        if (height_unique_prev || cost_unique_prev) && ...
-                           (height_unique_next || cost_unique_next)
-                            has_unique_grid = true;
-                            break;
-                        end
-                    end
-                    if has_unique_grid
-                        break;
-                    end
+            % Always keep first and last slices
+            if original_count <= 2
+                fprintf('Too few slices to simplify.\n');
+                return;
+            end
+            
+            valid_slices = true(original_count, 1);
+            removed_count = 0;
+            
+            % Check each intermediate slice (skip first and last)
+            k = 2;  % Start from second slice (index 2)
+            while k <= length(obj.slices) - 1
+                if k > length(obj.slices) - 1
+                    break;  % Safety check
                 end
                 
-                % 3. 如果没有唯一网格，标记为冗余
-                if ~has_unique_grid
-                    valid_slices(k) = false;
+                slice_k = obj.slices{k};
+                slice_prev = obj.slices{k-1};
+                slice_next = obj.slices{k+1};
+                
+                % Define Mk: set of traversable grids in slice k
+                % A grid (i,j) is traversable if cT < c_B
+                Mk = (slice_k.cT < obj.costParams.c_B) & ~isnan(slice_k.cT);
+                Mk_prev = (slice_prev.cT < obj.costParams.c_B) & ~isnan(slice_prev.cT);
+                Mk_next = (slice_next.cT < obj.costParams.c_B) & ~isnan(slice_next.cT);
+                
+                % Check if Mk ⊆ (Mk-1 ∪ Mk+1)
+                % This means every traversable grid in k must also be traversable 
+                % in either k-1 or k+1 (or both)
+                union_prev_next = Mk_prev | Mk_next;
+                is_subset = all(Mk(:) <= union_prev_next(:));  % Mk ⊆ union
+                
+                % Count grids for reporting
+                count_k = sum(Mk(:));
+                count_prev = sum(Mk_prev(:));
+                count_next = sum(Mk_next(:));
+                count_union = sum(union_prev_next(:));
+                
+                if is_subset
+                    % Slice k is redundant - can be omitted
+                    fprintf('Slice %d (z=%.2fm): Mk ⊆ (Mk-1 ∪ Mk+1) -> REMOVED\n', ...
+                        k-1, slice_k.z);
+                    fprintf('  |Mk|=%d, |Mk-1|=%d, |Mk+1|=%d, |Mk-1∪Mk+1|=%d\n', ...
+                        count_k, count_prev, count_next, count_union);
+                    
+                    % Remove this slice
+                    obj.slices(k) = [];
+                    removed_count = removed_count + 1;
+                    
+                    % After removal, check if the next slice (now at position k) 
+                    % becomes redundant relative to the NEW neighbors
+                    % Don't increment k, re-check current position
+                    
+                else
+                    % Slice k is preserved
+                    fprintf('Slice %d (z=%.2fm): Mk ⊄ (Mk-1 ∪ Mk+1) -> KEPT\n', ...
+                        k-1, slice_k.z);
+                    fprintf('  |Mk|=%d, |Mk-1|=%d, |Mk+1|=%d, |Mk-1∪Mk+1|=%d\n', ...
+                        count_k, count_prev, count_next, count_union);
+                    
+                    % Move to next slice
+                    k = k + 1;
+                end
+                
+                % Safety check to prevent infinite loop
+                if k > 100
+                    fprintf('Safety break: too many iterations\n');
+                    break;
                 end
             end
             
-            % 4. 移除冗余切片
-            obj.slices = obj.slices(valid_slices);
+            % Update slice indices to be consecutive
+            for i = 1:length(obj.slices)
+                obj.slices{i}.k = i - 1;  % 0-based indexing
+            end
+            
             obj.N = length(obj.slices) - 1;
             
-            % 5. 打印简化结果
-            fprintf('Tomogram simplified: %d -> %d slices (%.1f%% reduction)\n', ...
-                original_count, length(obj.slices), ...
-                (1 - length(obj.slices)/original_count) * 100);
+            % Print final results
+            final_count = length(obj.slices);
+            reduction_percent = (removed_count / original_count) * 100;
+            
+            fprintf('\nSimplification Results:\n');
+            fprintf('  Original slices: %d\n', original_count);
+            fprintf('  Remaining slices: %d\n', final_count);
+            fprintf('  Removed slices: %d\n', removed_count);
+            fprintf('  Reduction: %.1f%%\n', reduction_percent);
+            
+            % Print remaining slice information
+            fprintf('\nRemaining slice heights:\n');
+            for i = 1:length(obj.slices)
+                slice = obj.slices{i};
+                traversable_count = sum(slice.cT(:) < obj.costParams.c_B & ~isnan(slice.cT(:)));
+                fprintf('  Slice %d: z=%.2fm (%d traversable grids)\n', ...
+                    i-1, slice.z, traversable_count);
+            end
         end
         
         function visualizeSlices(obj)
@@ -573,73 +640,80 @@ classdef TomogramProcessor < handle
         end
         
         function path = planPath(obj, startPos, endPos)
-            % Plan a path from startPos to endPos using A* algorithm
-            % startPos and endPos are [x, y, z] in world coordinates
+            % Plan a path from startPos to endPos using modified A* for tomogram slices
+            % Following PCT paper "Path Planning through Slices" section
             
             % Convert world coordinates to grid indices
             startX = startPos(1); startY = startPos(2); startZ = startPos(3);
             endX = endPos(1); endY = endPos(2); endZ = endPos(3);
             
-            startI = max(1, min(obj.gridSize(1), ceil((startY - obj.minY) / obj.rg)));
-            startJ = max(1, min(obj.gridSize(2), ceil((startX - obj.minX) / obj.rg)));
-            startK = max(1, min(obj.N+1, ceil((startZ - obj.minZ) / obj.ds)));
+            % Find which slice contains the start and end positions
+            startSliceIdx = obj.findSliceContaining(startZ);
+            endSliceIdx = obj.findSliceContaining(endZ);
             
-            endI = max(1, min(obj.gridSize(1), ceil((endY - obj.minY) / obj.rg)));
-            endJ = max(1, min(obj.gridSize(2), ceil((endX - obj.minX) / obj.rg)));
-            endK = max(1, min(obj.N+1, ceil((endZ - obj.minZ) / obj.ds)));
-            
-            fprintf('Planning path from [%d,%d,%d] to [%d,%d,%d]\n', ...
-                startI, startJ, startK, endI, endJ, endK);
-            
-            % Check if start and end positions are traversable
-            if ~obj.isTraversable(startI, startJ, startK) || ~obj.isTraversable(endI, endJ, endK)
-                fprintf('Start or end position is not traversable!\n');
+            if startSliceIdx == 0 || endSliceIdx == 0
+                fprintf('Start or end position not in any slice!\n');
                 path = [];
                 return;
             end
             
-            % Initialize A* data structures
-            % Use a simple matrix for the OPEN set: each row is
-            % [i, j, k, gScore, fScore]. We always pick the row with the
-            % smallest fScore.
-            openSet = [startI, startJ, startK, 0, ...
-                      obj.heuristic([startI, startJ, startK], [endI, endJ, endK])];
+            startI = max(1, min(obj.gridSize(1), ceil((startY - obj.minY) / obj.rg)));
+            startJ = max(1, min(obj.gridSize(2), ceil((startX - obj.minX) / obj.rg)));
             
-            % Use string keys for the maps
+            endI = max(1, min(obj.gridSize(1), ceil((endY - obj.minY) / obj.rg)));
+            endJ = max(1, min(obj.gridSize(2), ceil((endX - obj.minX) / obj.rg)));
+            
+            fprintf('Planning path from [%d,%d,%d] to [%d,%d,%d]\n', ...
+                startI, startJ, startSliceIdx, endI, endJ, endSliceIdx);
+            
+            % Check if start and end positions are traversable
+            if ~obj.isTraversable(startI, startJ, startSliceIdx) || ~obj.isTraversable(endI, endJ, endSliceIdx)
+                fprintf('Start or end position is not traversable!\n');
+                fprintf('Start traversable: %d, End traversable: %d\n', ...
+                    obj.isTraversable(startI, startJ, startSliceIdx), ...
+                    obj.isTraversable(endI, endJ, endSliceIdx));
+                path = [];
+                return;
+            end
+            
+            % Initialize A* data structures with 3D nodes
+            % Each node is [i, j, slice_idx, gScore, fScore]
+            openSet = [startI, startJ, startSliceIdx, 0, ...
+                      obj.heuristic([startI, startJ, startSliceIdx], [endI, endJ, endSliceIdx])];
+            
             cameFrom = containers.Map('KeyType', 'char', 'ValueType', 'any');
             gScore = containers.Map('KeyType', 'char', 'ValueType', 'double');
             fScore = containers.Map('KeyType', 'char', 'ValueType', 'double');
             
             % Initialize scores
-            startKey = obj.nodeToKey([startI, startJ, startK]);
+            startKey = obj.nodeToKey([startI, startJ, startSliceIdx]);
             gScore(startKey) = 0;
-            fScore(startKey) = obj.heuristic([startI, startJ, startK], [endI, endJ, endK]);
+            fScore(startKey) = obj.heuristic([startI, startJ, startSliceIdx], [endI, endJ, endSliceIdx]);
             
             % A* main loop
             while ~isempty(openSet)
                 % Extract the node with the lowest fScore
                 [~, idxMin] = min(openSet(:, 5));
                 current = openSet(idxMin, :);
-                % Remove it from the open set
                 openSet(idxMin, :) = [];
                 currentNode = current(1:3);
                 currentKey = obj.nodeToKey(currentNode);
                 
                 % Check if goal reached
-                if all(currentNode == [endI, endJ, endK])
+                if all(currentNode == [endI, endJ, endSliceIdx])
                     path = obj.reconstructPath(cameFrom, currentNode);
                     fprintf('Path found with %d steps!\n', size(path,1));
                     return;
                 end
                 
-                % Get neighbors
-                neighbors = obj.getNeighbors(currentNode);
+                % Get neighbors following the paper's approach
+                neighbors = obj.getNeighborsWithGateways(currentNode);
                 for n = 1:size(neighbors,1)
                     neighborNode = neighbors(n,:);
                     neighborKey = obj.nodeToKey(neighborNode);
                     
-                    % Calculate movement cost
-                    moveCost = obj.calculateMovementCost(currentNode, neighborNode);
+                    % Calculate movement cost using paper's method
+                    moveCost = obj.calculateNodeCost(currentNode, neighborNode);
                     if isinf(moveCost)
                         continue;  % Skip impassable transitions
                     end
@@ -650,7 +724,7 @@ classdef TomogramProcessor < handle
                         % This path is better than any previous one
                         cameFrom(neighborKey) = currentNode;
                         gScore(neighborKey) = tentative_gScore;
-                        f = tentative_gScore + obj.heuristic(neighborNode, [endI, endJ, endK]);
+                        f = tentative_gScore + obj.heuristic(neighborNode, [endI, endJ, endSliceIdx]);
                         fScore(neighborKey) = f;
                         openSet = [openSet; neighborNode, tentative_gScore, f];
                     end
@@ -658,64 +732,23 @@ classdef TomogramProcessor < handle
             end
             
             fprintf('No path found!\n');
-            path = [];  % No path found
+            path = [];
         end
         
-        function cost = calculateMovementCost(obj, node1, node2)
-            % Calculate the cost of moving from node1 to node2 based on the paper's methodology
-            if ~obj.isTraversable(node2(1), node2(2), node2(3))
-                cost = inf;
-                return;
-            end
-            
-            % Get slice data
-            slice1 = obj.slices{node1(3)};
-            slice2 = obj.slices{node2(3)};
-            
-            % Get ground and ceiling heights
-            g1 = slice1.eG(node1(1), node1(2));  % Ground height
-            c1 = slice1.eC(node1(1), node1(2));  % Ceiling height
-            g2 = slice2.eG(node2(1), node2(2));
-            c2 = slice2.eC(node2(1), node2(2));
-            
-            % Calculate interval costs (c') as per paper
-            h1 = c1 - g1;  % Height interval for node1
-            h2 = c2 - g2;  % Height interval for node2
-            
-            % Base interval cost calculation
-            if h1 < obj.robotParams.d_min || h2 < obj.robotParams.d_min
-                cost = inf;  % Non-traversable if clearance too small
-                return;
-            end
-            
-            % Interval cost based on clearance
-            c_int1 = 1 / (h1 - obj.robotParams.d_min);
-            c_int2 = 1 / (h2 - obj.robotParams.d_min);
-            
-            % Base movement cost (Euclidean distance)
-            if node1(3) == node2(3)  % Same slice
-                dist = norm([node1(1:2) - node2(1:2)]);
-            else  % Different slices - check gateway conditions
-                % Verify gateway grid conditions
-                if abs(g1 - g2) > obj.robotParams.d_sm  % Ground elevation difference too large
-                    cost = inf;
+        function sliceIdx = findSliceContaining(obj, z)
+            % Find which slice contains the given z coordinate
+            sliceIdx = 0;
+            for k = 1:length(obj.slices)
+                slice = obj.slices{k};
+                if z >= slice.z - obj.ds/2 && z <= slice.z + obj.ds/2
+                    sliceIdx = k;
                     return;
                 end
-                
-                % Add vertical transition penalty
-                dist = norm([node1(1:2) - node2(1:2)]) * 1.5;  % Higher cost for slice transitions
             end
-            
-            % Height difference penalty
-            heightDiff = abs(g2 - g1);
-            heightPenalty = heightDiff * obj.costParams.alpha_s;
-            
-            % Combine costs as per paper
-            cost = dist * (1 + (c_int1 + c_int2)/2) + heightPenalty;
         end
         
-        function neighbors = getNeighbors(obj, node)
-            % Get valid neighbors with gateway grid consideration
+        function neighbors = getNeighborsWithGateways(obj, node)
+            % Get neighbors following the paper's gateway approach
             i = node(1); j = node(2); k = node(3);
             neighbors = [];
             
@@ -729,40 +762,116 @@ classdef TomogramProcessor < handle
                     nj = j + dj;
                     
                     if ni >= 1 && ni <= obj.gridSize(1) && ...
-                       nj >= 1 && nj <= obj.gridSize(2)
+                       nj >= 1 && nj <= obj.gridSize(2) && ...
+                       obj.isTraversable(ni, nj, k)
                         neighbors = [neighbors; ni, nj, k];
                     end
                 end
             end
             
-            % Check for gateway grids in adjacent slices
-            if k > 1  % Check lower slice
-                slice_current = obj.slices{k};
-                slice_lower = obj.slices{k-1};
-                
-                % Check gateway conditions
-                g_current = slice_current.eG(i,j);
-                g_lower = slice_lower.eG(i,j);
-                
-                if abs(g_current - g_lower) <= obj.robotParams.d_sm && ...
-                   obj.isTraversable(i, j, k-1)
-                    neighbors = [neighbors; i, j, k-1];
+            % Check gateway connections to adjacent slices
+            % According to paper: check grids at same planimetric position (i,j)
+            current_slice = obj.slices{k};
+            current_ground = current_slice.eG(i,j);
+            current_cost = current_slice.cT(i,j);
+            
+            % Check upper slice (k+1)
+            if k < length(obj.slices)
+                upper_slice = obj.slices{k+1};
+                if ~isnan(upper_slice.eG(i,j)) && ~isnan(upper_slice.cT(i,j))
+                    upper_ground = upper_slice.eG(i,j);
+                    upper_cost = upper_slice.cT(i,j);
+                    
+                    % Gateway condition from paper: same ground elevation
+                    if abs(current_ground - upper_ground) < 0.01  % Same ground elevation
+                        % This is considered the same node in 3D space
+                        % Choose the slice with lower cost (paper's c^N = min(c^T_k, c^T_{k+1}))
+                        if upper_cost <= current_cost && obj.isTraversable(i, j, k+1)
+                            neighbors = [neighbors; i, j, k+1];
+                        end
+                    else
+                        % Different ground elevations - check if it's a valid transition
+                        if upper_cost <= current_cost && obj.isTraversable(i, j, k+1)
+                            neighbors = [neighbors; i, j, k+1];
+                        end
+                    end
                 end
             end
             
-            if k < length(obj.slices)  % Check upper slice
-                slice_current = obj.slices{k};
-                slice_upper = obj.slices{k+1};
-                
-                % Check gateway conditions
-                g_current = slice_current.eG(i,j);
-                g_upper = slice_upper.eG(i,j);
-                
-                if abs(g_current - g_upper) <= obj.robotParams.d_sm && ...
-                   obj.isTraversable(i, j, k+1)
-                    neighbors = [neighbors; i, j, k+1];
+            % Check lower slice (k-1)
+            if k > 1
+                lower_slice = obj.slices{k-1};
+                if ~isnan(lower_slice.eG(i,j)) && ~isnan(lower_slice.cT(i,j))
+                    lower_ground = lower_slice.eG(i,j);
+                    lower_cost = lower_slice.cT(i,j);
+                    
+                    % Gateway condition from paper
+                    if abs(current_ground - lower_ground) < 0.01  % Same ground elevation
+                        % Same node in 3D space
+                        if lower_cost <= current_cost && obj.isTraversable(i, j, k-1)
+                            neighbors = [neighbors; i, j, k-1];
+                        end
+                    else
+                        % Different ground elevations
+                        if lower_cost <= current_cost && obj.isTraversable(i, j, k-1)
+                            neighbors = [neighbors; i, j, k-1];
+                        end
+                    end
                 end
             end
+        end
+        
+        function cost = calculateNodeCost(obj, node1, node2)
+            % Calculate movement cost between nodes following the paper's method
+            i1 = node1(1); j1 = node1(2); k1 = node1(3);
+            i2 = node2(1); j2 = node2(2); k2 = node2(3);
+            
+            % Check if nodes are traversable
+            if ~obj.isTraversable(i1, j1, k1) || ~obj.isTraversable(i2, j2, k2)
+                cost = inf;
+                return;
+            end
+            
+            slice1 = obj.slices{k1};
+            slice2 = obj.slices{k2};
+            
+            % Get node costs following paper's c^N formula
+            if k1 == k2
+                % Same slice - use regular traversability cost
+                node_cost = slice1.cT(i2, j2);
+            else
+                % Different slices - check if they represent the same 3D node
+                ground1 = slice1.eG(i1, j1);
+                ground2 = slice2.eG(i2, j2);
+                
+                if i1 == i2 && j1 == j2 && abs(ground1 - ground2) < 0.01
+                    % Same 3D node: c^N = min(c^T_{i,j,k}, c^T_{i,j,k+1})
+                    node_cost = min(slice1.cT(i1, j1), slice2.cT(i2, j2));
+                else
+                    % Different nodes - use target node cost
+                    node_cost = slice2.cT(i2, j2);
+                end
+            end
+            
+            % Check if connection breaks (c^N = c^B)
+            if node_cost >= obj.costParams.c_B
+                cost = inf;
+                return;
+            end
+            
+            % Calculate Euclidean distance
+            if k1 == k2
+                % Same slice
+                dist = sqrt((i2-i1)^2 + (j2-j1)^2);
+            else
+                % Different slices - include vertical component
+                z1 = slice1.z;
+                z2 = slice2.z;
+                dist = sqrt((i2-i1)^2 + (j2-j1)^2 + ((z2-z1)/obj.ds)^2);
+            end
+            
+            % Final cost: node cost + Euclidean distance
+            cost = node_cost + dist;
         end
         
         function h = heuristic(obj, node1, node2)
@@ -819,6 +928,13 @@ classdef TomogramProcessor < handle
                     valid = false;
                     return;
                 end
+            end
+            
+            % Additional check for support
+            support = slice.z - slice.eG(i,j);
+            if support > 0.8*obj.ds
+                valid = false;
+                return;
             end
             
             valid = true;
@@ -974,6 +1090,29 @@ classdef TomogramProcessor < handle
             fprintf('Original path length: %.2f m\n', origDist);
             fprintf('Optimized path length: %.2f m\n', optDist);
             fprintf('Length reduction: %.1f%%\n', (1 - optDist/origDist) * 100);
+        end
+        
+        function plotCostTrends(obj)
+            % Plot mean CI, CG, CInit across all slices
+            n = length(obj.slices);
+            meanCI   = nan(1,n);
+            meanCG   = nan(1,n);
+            meanInit = nan(1,n);
+            for k = 1:n
+                sl = obj.slices{k};
+                meanCI(k)   = mean(sl.cI(~isnan(sl.cI)));     %#ok<NASGU>
+                meanCG(k)   = mean(sl.cG(~isnan(sl.cG)));
+                meanInit(k) = mean(sl.cInit(~isnan(sl.cInit)));
+            end
+            figure('Name','Cost Trends Across Slices');
+            plot(0:n-1, meanCI,'-o','LineWidth',1.5); hold on;
+            plot(0:n-1, meanCG,'-s','LineWidth',1.5);
+            plot(0:n-1, meanInit,'-d','LineWidth',1.5);
+            grid on;
+            xlabel('Slice index (k)');
+            ylabel('Mean cost');
+            legend({'c_I','c_G','c_{Init}'},'Location','best');
+            title('Cost Component Trends Across Slices');
         end
     end
 end 

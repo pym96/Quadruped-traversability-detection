@@ -995,477 +995,85 @@ classdef TomogramProcessor < handle
         end
         
         function optimizedPath = optimizePCTTrajectory(obj, path, robotParams)
-            % PCT Trajectory Optimization following paper Equation (11)
-            % M-piece 3D polynomials with proper constraints
-            
+            % Optimize trajectory using quintic polynomial optimization
             if size(path, 1) < 3
                 optimizedPath = path;
                 return;
             end
             
-            fprintf('\n=== PCT Trajectory Optimization (Paper Equation 11) ===\n');
-            
-            % Convert grid path to world coordinates (this is our reference trajectory)
-            worldPath = obj.convertPathToWorld(path);
-            
-            % Determine number of pieces (M) based on path complexity
-            M = obj.determineOptimalPieces(worldPath);
-            fprintf('Using M=%d pieces for trajectory optimization\n', M);
+            fprintf('Optimizing trajectory with quintic polynomials...\n');
             
             % Time parameterization
-            totalDist = sum(sqrt(sum(diff(worldPath).^2, 2)));
-            T_total = totalDist / 0.3;  % 0.3 m/s average speed
-            T_pieces = linspace(0, T_total, M+1);  % Time breakpoints
+            totalDist = sum(sqrt(sum(diff(path).^2, 2)));
+            avgSpeed = 0.5;  % m/s
+            T = totalDist / avgSpeed;
+            t = linspace(0, T, size(path, 1))';
             
-            % Create reference trajectory functions Zref(q(t))
-            [Zref_func, t_ref] = obj.createReferenceTrajectory(worldPath, T_total);
+            % Initialize optimized trajectory
+            optimizedPath = zeros(size(path));
             
-            % Initialize optimization variables
-            % Each piece has 6 coefficients (σ0, σ1, ..., σ5) for each dimension (x,y,z)
-            numVars = M * 6 * 3;  % M pieces × 6 coefficients × 3 dimensions
-            
-            % Create constraint matrices and vectors
-            [Aeq, beq, A, b, lb, ub] = obj.buildConstraintMatrices(worldPath, M, T_pieces, robotParams);
-            
-            % Define cost function (Equation 11a)
-            costFun = @(vars) obj.evaluatePCTCost(vars, M, T_pieces, Zref_func, t_ref, robotParams);
-            
-            % Initial guess: simple interpolation between waypoints
-            x0 = obj.generateInitialGuess(worldPath, M, T_pieces);
-            
-            % Solve optimization problem
-            fprintf('Solving trajectory optimization with %d variables...\n', numVars);
-            options = optimoptions('fmincon', ...
-                'Display', 'iter-detailed', ...
-                'Algorithm', 'interior-point', ...
-                'MaxIterations', 1000, ...
-                'MaxFunctionEvaluations', 5000, ...
-                'ConstraintTolerance', 1e-6, ...
-                'OptimalityTolerance', 1e-6);
-            
-            try
-                [vars_opt, fval, exitflag] = fmincon(costFun, x0, A, b, Aeq, beq, lb, ub, [], options);
-                
-                if exitflag > 0
-                    fprintf('Optimization successful! Cost: %.6f\n', fval);
-                    
-                    % Generate final trajectory with high resolution for smoothness
-                    numHighResPoints = max(200, size(worldPath,1) * 5);  % At least 200 points or 5x original
-                    optimizedPath = obj.generateTrajectoryFromCoeffs(vars_opt, M, T_pieces, numHighResPoints);
-                    
-                    % Verify constraints
-                    obj.verifyTrajectoryConstraints(optimizedPath, robotParams);
-                    
-                else
-                    fprintf('Optimization failed (exitflag=%d), using reference path\n', exitflag);
-                    optimizedPath = worldPath;
-                end
-                
-            catch ME
-                fprintf('Optimization error: %s\n', ME.message);
-                fprintf('Using reference path as fallback\n');
-                optimizedPath = worldPath;
-            end
-            
-            % Analyze trajectory quality
-            obj.analyzePCTTrajectory(worldPath, optimizedPath, M, T_pieces);
-        end
-        
-        function M = determineOptimalPieces(obj, worldPath)
-            % Determine optimal number of pieces based on path complexity
-            
-            % Analyze path curvature and height changes
-            pathLen = size(worldPath, 1);
-            
-            % Calculate curvature at each point
-            curvatures = zeros(pathLen-2, 1);
-            for i = 2:pathLen-1
-                v1 = worldPath(i,:) - worldPath(i-1,:);
-                v2 = worldPath(i+1,:) - worldPath(i,:);
-                
-                if norm(v1) > 0 && norm(v2) > 0
-                    cosAngle = dot(v1, v2) / (norm(v1) * norm(v2));
-                    curvatures(i-1) = acos(max(-1, min(1, cosAngle)));
-                end
-            end
-            
-            % Calculate height changes
-            heightChanges = abs(diff(worldPath(:,3)));
-            
-            % Determine number of pieces based on complexity
-            highCurvature = sum(curvatures > 0.5);  % 30 degrees
-            significantHeightChange = sum(heightChanges > 0.1);  % 10cm
-            
-            M = max(3, min(8, ceil((highCurvature + significantHeightChange) / 3)));
-            fprintf('Path analysis: %d high curvature points, %d significant height changes\n', ...
-                highCurvature, significantHeightChange);
-        end
-        
-        function [Zref_func, t_ref] = createReferenceTrajectory(obj, worldPath, T_total)
-            % Create reference trajectory function Zref(q(t)) from A* path
-            
-            % Time parameterization for reference path
-            distances = [0; cumsum(sqrt(sum(diff(worldPath).^2, 2)))];
-            t_ref = distances / distances(end) * T_total;
-            
-            % Create interpolation functions for reference trajectory
-            Zref_func = struct();
-            Zref_func.x = @(t) interp1(t_ref, worldPath(:,1), t, 'pchip', 'extrap');
-            Zref_func.y = @(t) interp1(t_ref, worldPath(:,2), t, 'pchip', 'extrap');
-            Zref_func.z = @(t) interp1(t_ref, worldPath(:,3), t, 'pchip', 'extrap');
-            
-            fprintf('Created reference trajectory with %d waypoints over %.2fs\n', ...
-                size(worldPath,1), T_total);
-        end
-        
-        function [Aeq, beq, A, b, lb, ub] = buildConstraintMatrices(obj, worldPath, M, T_pieces, robotParams)
-            % Build constraint matrices for PCT optimization (Equations 11b-11f)
-            
-            numVars = M * 6 * 3;  % M pieces × 6 coefficients × 3 dimensions
-            
-            % Boundary conditions (11b): q1(0) = q̄0, qM(T) = q̄f
-            % Continuity constraints (11c): qi[3](Ti) = qi+1[3](0) for i=1,...,M-1
-            
-            numEqConstraints = 6 + 3*(M-1)*4;  % Start/end (6) + continuity (3*(M-1)*4)
-            Aeq = zeros(numEqConstraints, numVars);
-            beq = zeros(numEqConstraints, 1);
-            
-            % Helper function for polynomial basis
-            beta = @(t) [1, t, t^2, t^3, t^4, t^5];
-            dbeta = @(t) [0, 1, 2*t, 3*t^2, 4*t^3, 5*t^4];
-            ddbeta = @(t) [0, 0, 2, 6*t, 12*t^2, 20*t^3];
-            dddbeta = @(t) [0, 0, 0, 6, 24*t, 60*t^2];
-            
-            rowIdx = 1;
-            
-            % Start position constraints: q1(0) = [x0, y0, z0]
+            % Optimize each dimension separately
             for dim = 1:3
-                coeffIdx = (dim-1)*M*6 + (1:6);  % First piece, current dimension
-                Aeq(rowIdx, coeffIdx) = beta(0);
-                beq(rowIdx) = worldPath(1, dim);
-                rowIdx = rowIdx + 1;
+                % Setup quintic polynomial basis
+                beta = @(t) [ones(size(t)), t, t.^2, t.^3, t.^4, t.^5];
+                dbeta = @(t) [zeros(size(t)), ones(size(t)), 2*t, 3*t.^2, 4*t.^3, 5*t.^4];
+                ddbeta = @(t) [zeros(size(t)), zeros(size(t)), 2*ones(size(t)), 6*t, 12*t.^2, 20*t.^3];
+                
+                % Setup optimization constraints
+                p0 = path(1, dim);    % Initial position
+                pf = path(end, dim);  % Final position
+                v0 = 0;               % Initial velocity
+                vf = 0;               % Final velocity
+                a0 = 0;               % Initial acceleration
+                af = 0;               % Final acceleration
+                
+                % Equality constraints (position, velocity, acceleration)
+                Aeq = [beta(0); beta(T); dbeta(0); dbeta(T); ddbeta(0); ddbeta(T)];
+                beq = [p0; pf; v0; vf; a0; af];
+                
+                % Cost function: minimize jerk
+                costFun = @(sigma) sum((ddbeta(t) * sigma').^2);
+                
+                % Initial guess
+                sigma0 = zeros(6, 1);
+                sigma0(1) = p0;
+                sigma0(2) = (pf - p0) / T;
+                
+                % Optimize coefficients
+                options = optimoptions('fmincon', 'Display', 'off');
+                sigma = fmincon(costFun, sigma0, [], [], Aeq, beq, [], [], [], options);
+                
+                % Generate optimized trajectory points
+                optimizedPath(:, dim) = beta(t) * sigma;
             end
             
-            % End position constraints: qM(T_M) = [xf, yf, zf]
-            T_M = T_pieces(end) - T_pieces(end-1);
-            for dim = 1:3
-                coeffIdx = (dim-1)*M*6 + (M-1)*6 + (1:6);  % Last piece, current dimension
-                Aeq(rowIdx, coeffIdx) = beta(T_M);
-                beq(rowIdx) = worldPath(end, dim);
-                rowIdx = rowIdx + 1;
-            end
-            
-            % Continuity constraints (11c) for each piece junction
-            for i = 1:M-1
-                T_i = T_pieces(i+1) - T_pieces(i);
-                
-                for dim = 1:3
-                    % Position continuity: qi(Ti) = qi+1(0)
-                    coeffIdx_i = (dim-1)*M*6 + (i-1)*6 + (1:6);
-                    coeffIdx_i1 = (dim-1)*M*6 + i*6 + (1:6);
-                    Aeq(rowIdx, coeffIdx_i) = beta(T_i);
-                    Aeq(rowIdx, coeffIdx_i1) = -beta(0);
-                    beq(rowIdx) = 0;
-                    rowIdx = rowIdx + 1;
-                    
-                    % Velocity continuity: qi'(Ti) = qi+1'(0)
-                    Aeq(rowIdx, coeffIdx_i) = dbeta(T_i);
-                    Aeq(rowIdx, coeffIdx_i1) = -dbeta(0);
-                    beq(rowIdx) = 0;
-                    rowIdx = rowIdx + 1;
-                    
-                    % Acceleration continuity: qi''(Ti) = qi+1''(0)
-                    Aeq(rowIdx, coeffIdx_i) = ddbeta(T_i);
-                    Aeq(rowIdx, coeffIdx_i1) = -ddbeta(0);
-                    beq(rowIdx) = 0;
-                    rowIdx = rowIdx + 1;
-                    
-                    % Jerk continuity: qi'''(Ti) = qi+1'''(0)
-                    Aeq(rowIdx, coeffIdx_i) = dddbeta(T_i);
-                    Aeq(rowIdx, coeffIdx_i1) = -dddbeta(0);
-                    beq(rowIdx) = 0;
-                    rowIdx = rowIdx + 1;
-                end
-            end
-            
-            % Inequality constraints will be handled in nonlinear constraints
-            A = [];
-            b = [];
-            
-            % Variable bounds
-            lb = -inf(numVars, 1);
-            ub = inf(numVars, 1);
-            
-            fprintf('Built constraint matrices: %d equality constraints, %d variables\n', ...
-                size(Aeq,1), numVars);
-        end
-        
-        function cost = evaluatePCTCost(obj, vars, M, T_pieces, Zref_func, t_ref, robotParams)
-            % Evaluate cost function from Equation 11a
-            
-            cost = 0;
-            w2 = 10.0;    % Weight for reference tracking
-            wT = 0.1;     % Weight for time penalty
-            
-            % Polynomial basis functions
-            beta = @(t) [1, t, t^2, t^3, t^4, t^5];
-            dddbeta = @(t) [0, 0, 0, 6, 24*t, 60*t^2];
-            
-            % Evaluate cost for each piece
-            for i = 1:M
-                T_i = T_pieces(i+1) - T_pieces(i);
-                t_start = T_pieces(i);
-                
-                % Extract coefficients for this piece
-                x_coeffs = vars((0*M + i-1)*6 + (1:6));
-                y_coeffs = vars((1*M + i-1)*6 + (1:6));
-                z_coeffs = vars((2*M + i-1)*6 + (1:6));
-                
-                % Jerk cost (Jc): ∫ ||q'''(t)||² dt
-                jerk_cost_x = obj.integrateJerkSquared(x_coeffs, T_i);
-                jerk_cost_y = obj.integrateJerkSquared(y_coeffs, T_i);
-                jerk_cost_z = obj.integrateJerkSquared(z_coeffs, T_i);
-                Jc = jerk_cost_x + jerk_cost_y + jerk_cost_z;
-                
-                % Reference tracking cost: ∫ ||qz(t) - Zref(q(t))||² dt
-                ref_cost = 0;
-                num_samples = 10;
-                for j = 1:num_samples
-                    t_local = (j-1) * T_i / (num_samples-1);
-                    t_global = t_start + t_local;
-                    
-                    % Evaluate polynomial at this time
-                    q_t = [
-                        beta(t_local) * x_coeffs;
-                        beta(t_local) * y_coeffs;
-                        beta(t_local) * z_coeffs
-                    ];
-                    
-                    % Get reference height at this position
-                    z_ref = Zref_func.z(t_global);
-                    
-                    % Reference tracking error
-                    ref_error = (q_t(3) - z_ref)^2;
-                    ref_cost = ref_cost + ref_error * T_i / num_samples;
-                end
-                
-                % Combine costs for this piece
-                piece_cost = Jc + w2 * ref_cost;
-                cost = cost + piece_cost;
-            end
-            
-            % Time penalty
-            total_time = T_pieces(end);
-            cost = cost + wT * total_time;
-        end
-        
-        function jerk_integral = integrateJerkSquared(obj, coeffs, T)
-            % Analytically integrate ||q'''(t)||² from 0 to T
-            % For quintic polynomial q(t) = σ0 + σ1*t + ... + σ5*t^5
-            % q'''(t) = 6*σ3 + 24*σ4*t + 60*σ5*t^2
-            
-            s3 = coeffs(4);
-            s4 = coeffs(5);
-            s5 = coeffs(6);
-            
-            % ∫[0,T] [6*σ3 + 24*σ4*t + 60*σ5*t^2]² dt
-            term1 = (6*s3)^2 * T;
-            term2 = 2*(6*s3)*(24*s4) * T^2 / 2;
-            term3 = (2*(6*s3)*(60*s5) + (24*s4)^2) * T^3 / 3;
-            term4 = 2*(24*s4)*(60*s5) * T^4 / 4;
-            term5 = (60*s5)^2 * T^5 / 5;
-            
-            jerk_integral = term1 + term2 + term3 + term4 + term5;
-        end
-        
-        function x0 = generateInitialGuess(obj, worldPath, M, T_pieces)
-            % Generate initial guess using simple interpolation
-            
-            numVars = M * 6 * 3;
-            x0 = zeros(numVars, 1);
-            
-            % For each dimension
-            for dim = 1:3
-                % Create time-parameterized path
-                path_times = linspace(0, T_pieces(end), size(worldPath,1));
-                path_values = worldPath(:, dim);
-                
-                % For each piece
-                for i = 1:M
-                    T_i = T_pieces(i+1) - T_pieces(i);
-                    t_start = T_pieces(i);
-                    t_end = T_pieces(i+1);
-                    
-                    % Sample points in this piece
-                    t_samples = linspace(t_start, t_end, 6);
-                    y_samples = interp1(path_times, path_values, t_samples, 'pchip');
-                    
-                    % Fit polynomial to these points (simple least squares)
-                    A_fit = zeros(6, 6);
-                    for j = 1:6
-                        t_local = t_samples(j) - t_start;
-                        A_fit(j, :) = [1, t_local, t_local^2, t_local^3, t_local^4, t_local^5];
-                    end
-                    
-                    coeffs = A_fit \ y_samples';
-                    
-                    % Store coefficients
-                    coeffIdx = (dim-1)*M*6 + (i-1)*6 + (1:6);
-                    x0(coeffIdx) = coeffs;
-                end
-            end
-            
-            fprintf('Generated initial guess with %d variables\n', numVars);
-        end
-        
-        function trajectory = generateTrajectoryFromCoeffs(obj, vars, M, T_pieces, numPoints)
-            % Generate trajectory from optimized coefficients with high resolution
-            
-            trajectory = zeros(numPoints, 3);
-            
-            % Create high-resolution time vector
-            t_trajectory = linspace(0, T_pieces(end), numPoints);
-            
-            beta = @(t) [1, t, t^2, t^3, t^4, t^5];
-            
-            fprintf('Generating %d-point trajectory from %d polynomial pieces...\n', numPoints, M);
-            
-            for k = 1:numPoints
-                t = t_trajectory(k);
-                
-                % Find which piece this time belongs to
-                piece_idx = find(t >= T_pieces(1:end-1) & t < T_pieces(2:end), 1);
-                if isempty(piece_idx)
-                    if t <= T_pieces(1)
-                        piece_idx = 1;
-                    else
-                        piece_idx = M;  % Handle end boundary case
-                    end
-                end
-                
-                % Local time within the piece (normalized to [0, T_piece])
-                t_local = t - T_pieces(piece_idx);
-                
-                % Extract coefficients for this piece and evaluate polynomial
-                for dim = 1:3
-                    coeffIdx = (dim-1)*M*6 + (piece_idx-1)*6 + (1:6);
-                    coeffs = vars(coeffIdx);
-                    trajectory(k, dim) = beta(t_local) * coeffs;
-                end
-            end
-            
-            % Report trajectory smoothness
-            obj.reportTrajectoryQuality(trajectory, T_pieces(end));
-        end
-        
-        function reportTrajectoryQuality(obj, trajectory, totalTime)
-            % Report trajectory quality metrics
-            
-            dt = totalTime / (size(trajectory,1) - 1);
-            
-            fprintf('Trajectory Quality Report:\n');
-            fprintf('  Resolution: %d points over %.2fs (dt=%.3fs)\n', ...
-                size(trajectory,1), totalTime, dt);
-            
-            % Calculate velocity, acceleration, and jerk
-            vel = diff(trajectory) / dt;
-            acc = diff(vel) / dt;
-            jerk = diff(acc) / dt;
-            
-            % Report maximum values
-            max_vel = max(sqrt(sum(vel.^2, 2)));
-            max_acc = max(sqrt(sum(acc.^2, 2)));
-            max_jerk = max(sqrt(sum(jerk.^2, 2)));
-            
-            fprintf('  Max velocity: %.3f m/s\n', max_vel);
-            fprintf('  Max acceleration: %.3f m/s²\n', max_acc);
-            fprintf('  Max jerk: %.3f m/s³\n', max_jerk);
-            
-            % Check for smoothness (no sudden jumps)
-            position_jumps = max(sqrt(sum(diff(trajectory).^2, 2)));
-            if position_jumps > 0.1  % 10cm jump threshold
-                fprintf('  WARNING: Large position jumps detected (%.3fm)\n', position_jumps);
-            else
-                fprintf('  Position continuity: GOOD (max jump %.3fm)\n', position_jumps);
-            end
-        end
-        
-        function verifyTrajectoryConstraints(obj, trajectory, robotParams)
-            % Verify that trajectory satisfies height constraints (11f)
-            
-            violations = 0;
-            for i = 1:size(trajectory, 1)
-                [Hg, Hc] = obj.queryHeightsAtPosition(trajectory(i,1), trajectory(i,2));
-                
-                if ~isnan(Hg) && ~isnan(Hc)
-                    if trajectory(i,3) < Hg || trajectory(i,3) > Hc
-                        violations = violations + 1;
+            % Apply ceiling constraints and ensure ground clearance
+            for i = 1:size(optimizedPath, 1)
+                % Find nearest slice
+                sliceIdx = obj.findNearestSlice(optimizedPath(i, 3));
+                if sliceIdx > 0 && sliceIdx <= length(obj.slices)
+                    % Get grid coordinates
+                    gridPos = obj.worldToGrid(optimizedPath(i, 1:2));
+                    if obj.isValidGridBounds(gridPos)
+                        % Get ground and ceiling heights
+                        slice = obj.slices{sliceIdx};
+                        groundHeight = slice.eG(gridPos(1), gridPos(2));
+                        ceilingHeight = slice.eC(gridPos(1), gridPos(2));
+                        
+                        if ~isnan(groundHeight) && ~isnan(ceilingHeight)
+                            % Ensure minimum clearance from ground
+                            minHeight = groundHeight + robotParams.d_min;
+                            % Ensure maximum clearance from ceiling
+                            maxHeight = ceilingHeight - 0.1;  % 10cm safety margin
+                            
+                            % Clamp height within valid range
+                            optimizedPath(i, 3) = min(max(optimizedPath(i, 3), minHeight), maxHeight);
+                        end
                     end
                 end
             end
             
-            fprintf('Trajectory verification: %d/%d points violate height constraints\n', ...
-                violations, size(trajectory,1));
-        end
-        
-        function analyzePCTTrajectory(obj, originalPath, optimizedPath, M, T_pieces)
-            % Analyze trajectory quality and smoothness
-            
-            fprintf('\n--- PCT Trajectory Analysis ---\n');
-            fprintf('Number of pieces: %d\n', M);
-            fprintf('Total time: %.2fs\n', T_pieces(end));
-            
-            % Path length comparison
-            orig_length = sum(sqrt(sum(diff(originalPath).^2, 2)));
-            opt_length = sum(sqrt(sum(diff(optimizedPath).^2, 2)));
-            fprintf('Path length: %.2fm → %.2fm (%.1f%% change)\n', ...
-                orig_length, opt_length, (opt_length/orig_length-1)*100);
-            
-            % Height difference
-            height_diff = optimizedPath(end,3) - optimizedPath(1,3);
-            fprintf('Height gain: %.2fm\n', height_diff);
-            
-            % Smoothness analysis
-            dt = T_pieces(end) / (size(optimizedPath,1)-1);
-            for dim = 1:3
-                dimName = {'X', 'Y', 'Z'};
-                
-                % Calculate derivatives
-                vel = diff(optimizedPath(:,dim)) / dt;
-                acc = diff(vel) / dt;
-                jerk = diff(acc) / dt;
-                
-                fprintf('%s: Max vel=%.2f, Max acc=%.2f, RMS jerk=%.2f\n', ...
-                    dimName{dim}, max(abs(vel)), max(abs(acc)), rms(jerk));
-            end
-        end
-        
-        function [groundHeight, ceilingHeight] = queryHeightsAtPosition(obj, x, y)
-            % Query Hg and Hc at position (x,y) from tomogram
-            groundHeight = NaN;
-            ceilingHeight = NaN;
-            
-            % Check bounds
-            if x < obj.minX || x > obj.maxX || y < obj.minY || y > obj.maxY
-                return;
-            end
-            
-            % Convert to grid coordinates
-            i = max(1, min(obj.gridSize(1), ceil((y - obj.minY) / obj.rg)));
-            j = max(1, min(obj.gridSize(2), ceil((x - obj.minX) / obj.rg)));
-            
-            % Find the best slice for this position (use middle slice as representative)
-            if ~isempty(obj.slices)
-                midSliceIdx = ceil(length(obj.slices) / 2);
-                slice = obj.slices{midSliceIdx};
-                
-                if i >= 1 && i <= obj.gridSize(1) && j >= 1 && j <= obj.gridSize(2)
-                    if ~isnan(slice.eG(i, j)) && ~isnan(slice.eC(i, j))
-                        groundHeight = slice.eG(i, j);
-                        ceilingHeight = slice.eC(i, j);
-                    end
-                end
-            end
+            fprintf('Trajectory optimized: %d waypoints\n', size(optimizedPath, 1));
         end
         
         function visualizeOptimizedTrajectory(obj, originalPath, optimizedPath)
@@ -1940,240 +1548,6 @@ classdef TomogramProcessor < handle
                 fprintf('   RESULT: TRAVERSABLE\n');
             else
                 fprintf('   RESULT: BLOCKED (unknown reason - check isTraversable method)\n');
-            end
-        end
-        
-        function visualizeTrajectoryInScene(obj, originalPath, optimizedPath, sceneParams)
-            % Visualize optimized trajectory in the original stair scene
-            
-            figure('Name', 'PCT Trajectory in Stair Scene', 'Position', [100, 100, 1400, 900]);
-            
-            % Main 3D view
-            subplot(2, 3, [1, 2, 4, 5]);
-            hold on;
-            
-            % 1. Draw the stair scene structure
-            if exist('sceneParams', 'var')
-                obj.drawStairStructure(sceneParams);
-            end
-            
-            % 2. Show tomogram slices as semi-transparent surfaces
-            obj.visualizeSlices();
-            alpha(0.3);  % Make slices semi-transparent
-            
-            % 3. Draw the original A* path
-            if ~isempty(originalPath)
-                % Convert grid indices to world coordinates for original path
-                origWorldPath = obj.convertPathToWorld(originalPath);
-                plot3(origWorldPath(:,1), origWorldPath(:,2), origWorldPath(:,3), ...
-                    'r--', 'LineWidth', 2, 'DisplayName', 'A* Path');
-                plot3(origWorldPath(1,1), origWorldPath(1,2), origWorldPath(1,3), ...
-                    'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r', 'DisplayName', 'Start');
-                plot3(origWorldPath(end,1), origWorldPath(end,2), origWorldPath(end,3), ...
-                    'rs', 'MarkerSize', 8, 'MarkerFaceColor', 'r', 'DisplayName', 'Goal');
-            end
-            
-            % 4. Draw the optimized trajectory
-            if ~isempty(optimizedPath)
-                plot3(optimizedPath(:,1), optimizedPath(:,2), optimizedPath(:,3), ...
-                    'g-', 'LineWidth', 3, 'DisplayName', 'Optimized Trajectory');
-                
-                % Mark key points along trajectory
-                numMarkers = min(10, size(optimizedPath, 1));
-                markerIndices = round(linspace(1, size(optimizedPath, 1), numMarkers));
-                plot3(optimizedPath(markerIndices,1), optimizedPath(markerIndices,2), optimizedPath(markerIndices,3), ...
-                    'go', 'MarkerSize', 6, 'MarkerFaceColor', 'g');
-            end
-            
-            % Enhance visualization
-            xlabel('X (m)'); ylabel('Y (m)'); zlabel('Z (m)');
-            title('PCT Navigation in Stair Scene');
-            legend('Location', 'best');
-            grid on;
-            axis equal;
-            view(45, 30);
-            
-            % Add lighting for better 3D perception
-            lighting gouraud;
-            light('Position', [1, 1, 1]);
-            
-            % Side view (XZ plane)
-            subplot(2, 3, 3);
-            hold on;
-            if ~isempty(originalPath)
-                origWorldPath = obj.convertPathToWorld(originalPath);
-                plot(origWorldPath(:,2), origWorldPath(:,3), 'r--', 'LineWidth', 2, 'DisplayName', 'A* Path');
-            end
-            if ~isempty(optimizedPath)
-                plot(optimizedPath(:,2), optimizedPath(:,3), 'g-', 'LineWidth', 3, 'DisplayName', 'Optimized');
-            end
-            
-            % Draw stair profile
-            if exist('sceneParams', 'var')
-                obj.drawStairProfile(sceneParams);
-            end
-            
-            xlabel('Y (m)'); ylabel('Z (m)');
-            title('Side View (Profile)');
-            legend('Location', 'best');
-            grid on;
-            
-            % Top view (XY plane)
-            subplot(2, 3, 6);
-            hold on;
-            if ~isempty(originalPath)
-                origWorldPath = obj.convertPathToWorld(originalPath);
-                plot(origWorldPath(:,1), origWorldPath(:,2), 'r--', 'LineWidth', 2, 'DisplayName', 'A* Path');
-            end
-            if ~isempty(optimizedPath)
-                plot(optimizedPath(:,1), optimizedPath(:,2), 'g-', 'LineWidth', 3, 'DisplayName', 'Optimized');
-            end
-            
-            % Draw stair footprint
-            if exist('sceneParams', 'var')
-                obj.drawStairFootprint(sceneParams);
-            end
-            
-            xlabel('X (m)'); ylabel('Y (m)');
-            title('Top View (Footprint)');
-            legend('Location', 'best');
-            grid on;
-            axis equal;
-            
-            % Add overall title with trajectory statistics
-            if ~isempty(originalPath) && ~isempty(optimizedPath)
-                origWorldPath = obj.convertPathToWorld(originalPath);
-                origDist = sum(sqrt(sum(diff(origWorldPath).^2, 2)));
-                optDist = sum(sqrt(sum(diff(optimizedPath).^2, 2)));
-                heightGain = optimizedPath(end,3) - optimizedPath(1,3);
-                
-                sgtitle(sprintf('PCT Quadruped Navigation\nPath Length: %.2fm → %.2fm (%.1f%% reduction), Height Gain: %.2fm', ...
-                    origDist, optDist, (1-optDist/origDist)*100, heightGain));
-            end
-            
-            hold off;
-        end
-        
-        function worldPath = convertPathToWorld(obj, gridPath)
-            % Convert grid path indices to world coordinates
-            worldPath = zeros(size(gridPath, 1), 3);
-            
-            for i = 1:size(gridPath, 1)
-                gridI = gridPath(i, 1);
-                gridJ = gridPath(i, 2);
-                sliceIdx = gridPath(i, 3);
-                
-                % Convert grid to world coordinates
-                worldPath(i, 1) = obj.minX + (gridJ - 1) * obj.rg;  % X
-                worldPath(i, 2) = obj.minY + (gridI - 1) * obj.rg;  % Y
-                
-                % Get Z from slice height
-                if sliceIdx >= 1 && sliceIdx <= length(obj.slices)
-                    worldPath(i, 3) = obj.slices{sliceIdx}.z;
-                else
-                    worldPath(i, 3) = 0;
-                end
-            end
-        end
-        
-        function drawStairStructure(obj, sceneParams)
-            % Draw 3D stair structure for context
-            if ~isfield(sceneParams, 'STEP_H') || ~isfield(sceneParams, 'STEP_D') || ~isfield(sceneParams, 'STEP_W')
-                return;
-            end
-            
-            stepH = sceneParams.STEP_H;
-            stepD = sceneParams.STEP_D;
-            stepW = sceneParams.STEP_W;
-            N = sceneParams.N;
-            
-            % Draw ascending stairs
-            for i = 1:N
-                x = [0, stepW, stepW, 0, 0];
-                y = [(i-1)*stepD, (i-1)*stepD, i*stepD, i*stepD, (i-1)*stepD];
-                z_bottom = [(i-1)*stepH, (i-1)*stepH, (i-1)*stepH, (i-1)*stepH, (i-1)*stepH];
-                z_top = [i*stepH, i*stepH, i*stepH, i*stepH, i*stepH];
-                
-                % Draw step surface
-                fill3(x, y, z_top, [0.8, 0.8, 0.8], 'FaceAlpha', 0.7, 'EdgeColor', 'k');
-                
-                % Draw step riser
-                if i > 1
-                    y_riser = [(i-1)*stepD, (i-1)*stepD, (i-1)*stepD, (i-1)*stepD, (i-1)*stepD];
-                    x_riser = [0, stepW, stepW, 0, 0];
-                    z_riser = [(i-1)*stepH, (i-1)*stepH, i*stepH, i*stepH, (i-1)*stepH];
-                    fill3(x_riser, y_riser, z_riser, [0.7, 0.7, 0.7], 'FaceAlpha', 0.7, 'EdgeColor', 'k');
-                end
-            end
-            
-            % Draw descending stairs
-            for i = 1:N
-                x = [0, stepW, stepW, 0, 0];
-                y = [N*stepD + i*stepD, N*stepD + i*stepD, N*stepD + (i+1)*stepD, N*stepD + (i+1)*stepD, N*stepD + i*stepD];
-                z_level = (N-i)*stepH;
-                z_bottom = [z_level, z_level, z_level, z_level, z_level];
-                z_top = [z_level, z_level, z_level, z_level, z_level];
-                
-                % Draw step surface
-                fill3(x, y, z_top, [0.8, 0.8, 0.8], 'FaceAlpha', 0.7, 'EdgeColor', 'k');
-            end
-        end
-        
-        function drawStairProfile(obj, sceneParams)
-            % Draw stair profile in side view
-            if ~isfield(sceneParams, 'STEP_H') || ~isfield(sceneParams, 'STEP_D')
-                return;
-            end
-            
-            stepH = sceneParams.STEP_H;
-            stepD = sceneParams.STEP_D;
-            N = sceneParams.N;
-            
-            % Ascending stairs profile
-            y_profile = [];
-            z_profile = [];
-            
-            for i = 0:N
-                y_profile = [y_profile, i*stepD, i*stepD];
-                z_profile = [z_profile, i*stepH, i*stepH];
-                if i < N
-                    y_profile = [y_profile, (i+1)*stepD];
-                    z_profile = [z_profile, i*stepH];
-                end
-            end
-            
-            % Descending stairs profile
-            for i = 1:N
-                y_val = N*stepD + i*stepD;
-                z_val = (N-i)*stepH;
-                y_profile = [y_profile, y_val];
-                z_profile = [z_profile, z_val];
-            end
-            
-            plot(y_profile, z_profile, 'k-', 'LineWidth', 2, 'DisplayName', 'Stair Profile');
-        end
-        
-        function drawStairFootprint(obj, sceneParams)
-            % Draw stair footprint in top view
-            if ~isfield(sceneParams, 'STEP_D') || ~isfield(sceneParams, 'STEP_W')
-                return;
-            end
-            
-            stepD = sceneParams.STEP_D;
-            stepW = sceneParams.STEP_W;
-            N = sceneParams.N;
-            
-            % Draw stair outline
-            totalLength = 2*N*stepD;
-            x_outline = [0, stepW, stepW, 0, 0];
-            y_outline = [0, 0, totalLength, totalLength, 0];
-            
-            plot(x_outline, y_outline, 'k-', 'LineWidth', 2, 'DisplayName', 'Stair Outline');
-            
-            % Draw step divisions
-            for i = 1:2*N-1
-                y_line = i * stepD;
-                plot([0, stepW], [y_line, y_line], 'k--', 'LineWidth', 1);
             end
         end
     end

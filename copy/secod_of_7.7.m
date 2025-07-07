@@ -32,18 +32,18 @@ classdef TomogramProcessor < handle
             end
             
             % Initialize parameters for traversability estimation
-            obj.robotParams.d_min = 0.25;    % Minimum robot height
-            obj.robotParams.d_ref = 0.50;    % Reference (normal) robot height
+            obj.robotParams.d_min = 0.35;    % Minimum robot height
+            obj.robotParams.d_ref = 0.55;    % Reference (normal) robot height
             % Safety margin for vertical transitions
             obj.robotParams.d_sm = 0.2;      % Same as costParams.d_sm
             % Maximum acceptable ground slope (same as theta_s threshold)
             obj.robotParams.theta_max = 0.5;
             
-            obj.costParams.c_B = 50;        % Barrier/obstacle cost
-            obj.costParams.alpha_d = 0.5;     % Height adjustment cost factor
+            obj.costParams.c_B = 92;        % Barrier/obstacle cost
+            obj.costParams.alpha_d = 0.4;     % Height adjustment cost factor
             obj.costParams.theta_b = 10;   % Obstacle boundary threshold
             obj.costParams.theta_s = 0.7;   % Flat surface threshold
-            obj.costParams.theta_p = 0.3;   % Safe neighbor ratio threshold
+            obj.costParams.theta_p = 0.2;   % Safe neighbor ratio threshold
             obj.costParams.alpha_s = 0.1;   % Surface cost factor
             obj.costParams.alpha_b = 0.1;     % Boundary cost factor
             obj.costParams.r_g = 0.15;      % Grid resolution
@@ -62,9 +62,10 @@ classdef TomogramProcessor < handle
         function obj = loadPointCloud(obj, points)
             % Load point cloud data and initialize parameters
             obj.pointCloud = points;
-            obj.zMin = min(points(:,3));
+            rawZmin = min(points(:,3));
+            obj.zMin = floor(rawZmin / obj.ds) * obj.ds;  % align to nearest slice plane
             obj.zMax = max(points(:,3));
-            obj.N = ceil((obj.zMax - obj.zMin) / obj.ds);
+            obj.N = ceil((obj.zMax - obj.zMin) / obj.ds);  % number of slices
             
             % Calculate grid size based on point cloud bounds
             xMax = max(points(:,1)); xMin = min(points(:,1));
@@ -258,6 +259,9 @@ classdef TomogramProcessor < handle
             
             % Remove invalid slices
             obj.removeInvalidSlices();
+            
+            % Plot cost trends
+            obj.plotCostTrends();
         end
         
         function visualizeSlice(obj, k)
@@ -339,8 +343,26 @@ classdef TomogramProcessor < handle
 
             [cG, gx, gy, mxy] = obj.calculateGroundCost(slice.eG);
 
-            cInit = 0.6 * cG;
+            maskHigh = slice.dI > obj.robotParams.d_ref;
+            cI(maskHigh) = 0;                 % 净空充足 → 0
+            % Fuse costs: if either component hits barrier, keep barrier;
+            % otherwise take weighted sum favouring ground cost.
+            cInit = max(cI, 0.5*cI + 0.5*cG);
             cT = min(obj.costParams.c_B, cInit);
+
+            % -----------------------------------------------------------------
+            % Additional invalidation: if the ground that supports this slice
+            % is farther than half a slice below the current plane, the robot
+            % cannot actually stand here.  Mark these cells invalid (NaN) so
+            % they will neither be considered traversable nor be rendered
+            % as blue patches in the visualization.
+            % -----------------------------------------------------------------
+            supportMap = slice.z - slice.eG;          % vertical distance to ground
+            farSupportMask = supportMap > 0.8*obj.ds;    % out of supporting range
+            cT(farSupportMask) = NaN;
+            cI(farSupportMask) = NaN;
+            cG(farSupportMask) = NaN;
+            cInit(farSupportMask) = NaN;
         end
         
         function [cG, gx, gy, mxy] = calculateGroundCost(obj, eG)
@@ -430,8 +452,8 @@ classdef TomogramProcessor < handle
         function obj = simplifyTomograms(obj)
             % Simplify tomogram slices by removing redundant ones
             % Parameters for simplification
-            threshold_height = 0.01;  % 高度变化阈值 (m)
-            threshold_cost = -0.1;      % 成本降低阈值
+            threshold_height = 0.0;  % 高度变化阈值 (m)
+            threshold_cost = 0.0;      % 成本降低阈值
             
             % 记录原始切片数
             original_count = length(obj.slices);
@@ -821,6 +843,13 @@ classdef TomogramProcessor < handle
                 end
             end
             
+            % Additional check for support
+            support = slice.z - slice.eG(i,j);
+            if support > 0.8*obj.ds
+                valid = false;
+                return;
+            end
+            
             valid = true;
         end
         
@@ -974,6 +1003,29 @@ classdef TomogramProcessor < handle
             fprintf('Original path length: %.2f m\n', origDist);
             fprintf('Optimized path length: %.2f m\n', optDist);
             fprintf('Length reduction: %.1f%%\n', (1 - optDist/origDist) * 100);
+        end
+        
+        function plotCostTrends(obj)
+            % Plot mean CI, CG, CInit across all slices
+            n = length(obj.slices);
+            meanCI   = nan(1,n);
+            meanCG   = nan(1,n);
+            meanInit = nan(1,n);
+            for k = 1:n
+                sl = obj.slices{k};
+                meanCI(k)   = mean(sl.cI(~isnan(sl.cI)));     %#ok<NASGU>
+                meanCG(k)   = mean(sl.cG(~isnan(sl.cG)));
+                meanInit(k) = mean(sl.cInit(~isnan(sl.cInit)));
+            end
+            figure('Name','Cost Trends Across Slices');
+            plot(0:n-1, meanCI,'-o','LineWidth',1.5); hold on;
+            plot(0:n-1, meanCG,'-s','LineWidth',1.5);
+            plot(0:n-1, meanInit,'-d','LineWidth',1.5);
+            grid on;
+            xlabel('Slice index (k)');
+            ylabel('Mean cost');
+            legend({'c_I','c_G','c_{Init}'},'Location','best');
+            title('Cost Component Trends Across Slices');
         end
     end
 end 
