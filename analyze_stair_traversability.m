@@ -48,8 +48,8 @@ fprintf('Noise level: %.3f m\n', NOISE);
 % Path planning parameters
 fprintf('\n=== Step 2: Path Planning ===\n');
 % Use the algorithm-found traversable positions for better success
-startPos = [0.0, 0.08, 0.10];  % Start: algorithm-found traversable position
-endPos = [0.0, 4.2, 0.10];     % End: latest algorithm-found traversable position
+startPos = [0.2, 0.08, 0.10];  % Start: algorithm-found traversable position
+endPos = [0.2, 4.2, 0.10];     % End: latest algorithm-found traversable position
 
 fprintf('Planning path from [%.2f, %.2f, %.2f] to [%.2f, %.2f, %.2f]\n', ...
     startPos(1), startPos(2), startPos(3), endPos(1), endPos(2), endPos(3));
