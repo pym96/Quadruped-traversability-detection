@@ -1,109 +1,113 @@
-%% Simple Stair Perception - Generate Synthetic Stair Point Cloud
-% This script generates a synthetic stair environment for testing
+%% simple_stair_perception.m
+% Minimal point-cloud environment: N ascending steps -> mid platform -> N descending steps.
+% Generates point cloud `pcd` and saves to simple_env.mat.
 
-clear;
+clear; clc;
 
-% Stair scene parameters
-N = 5;          % Number of steps (up and down)
-STEP_W = 0.4;   % Step width (m)
-STEP_H = 0.15;  % Step height (m)
-STEP_D = 0.3;   % Step depth (m)
-NOISE = 0.01;   % Sensor noise level (m)
+% --- Parameters (edit freely) ---
+STEP_W  = 1.0;   % step width   (m)
+STEP_H  = 0.20;  % step height  (m)
+STEP_D  = 0.30;  % step depth   (m)
+N       = 6;     % number of steps up (and down)
+NOISE   = 0.005; % std-dev Gaussian noise (m) - reduced for better analysis
+PTS_PER_M2 = 1000; % points per square meter for surface sampling
+CEILING_H = 2.0; % ceiling height above ground (m)
 
-fprintf('Generating synthetic stair scene...\n');
-fprintf('Steps: %d up & down\n', N);
-fprintf('Step dimensions: %.2fm x %.2fm x %.2fm (W x H x D)\n', STEP_W, STEP_H, STEP_D);
+% Initialize point cloud as empty matrix with 3 columns (x,y,z)
+P = zeros(0, 3);
 
-% Point cloud generation parameters
-pointsPerMeter2 = 200;  % Point density per square meter
+%% 1. initial ground platform (removed)
+plat0_area = STEP_W * STEP_D;
+plat0_pts = max(10, round(plat0_area * PTS_PER_M2));
+P = [P; makeSurface([0, STEP_D/2, 0], STEP_W, STEP_D, plat0_pts)];
 
-% Generate ascending stairs
-points = [];
-
-% Ascending stairs (going up)
+%% 2. ascending staircase (left side - going up)
 for i = 1:N
-    % Step surface
-    stepZ = i * STEP_H;
-    stepYmin = (i-1) * STEP_D;
-    stepYmax = i * STEP_D;
+    % Horizontal surface (step top)
+    step_top_area = STEP_W * STEP_D;
+    step_top_pts = max(10, round(step_top_area * PTS_PER_M2));
+    P = [P; makeSurface([0, STEP_D*(i+0.5), i*STEP_H], STEP_W, STEP_D, step_top_pts)];
     
-    % Generate points on step surface
-    numPointsStep = ceil(STEP_W * STEP_D * pointsPerMeter2);
-    x_step = rand(numPointsStep, 1) * STEP_W;
-    y_step = stepYmin + rand(numPointsStep, 1) * (stepYmax - stepYmin);
-    z_step = ones(numPointsStep, 1) * stepZ;
-    
-    % Add to point cloud
-    points = [points; x_step, y_step, z_step];
-    
-    % Step riser (vertical face)
-    if i > 1
-        numPointsRiser = ceil(STEP_W * STEP_H * pointsPerMeter2 * 2);
-        x_riser = rand(numPointsRiser, 1) * STEP_W;
-        y_riser = ones(numPointsRiser, 1) * stepYmin;
-        z_riser = (i-1) * STEP_H + rand(numPointsRiser, 1) * STEP_H;
-        
-        points = [points; x_riser, y_riser, z_riser];
-    end
+    % Vertical surface (step riser)
+    step_riser_area = STEP_W * STEP_H;
+    step_riser_pts = max(10, round(step_riser_area * PTS_PER_M2));
+    riser_y = STEP_D*(i+0.5) - STEP_D/2;
+    riser_x = (rand(step_riser_pts,1)-0.5)*STEP_W;    % X coordinates
+    riser_y_coords = repmat(riser_y, [step_riser_pts,1]);    % Y coordinates (fixed)
+    riser_z = (i-1)*STEP_H + rand(step_riser_pts,1)*STEP_H;  % Z coordinates
+    riser_points = [riser_x, riser_y_coords, riser_z];  % n x 3 matrix
+    P = [P; riser_points];
 end
 
-% Platform at the top
-platformYmin = N * STEP_D;
-platformYmax = N * STEP_D + STEP_D;
-platformZ = N * STEP_H;
+%% 3. high mid platform
+platM_area = STEP_W * STEP_D;
+platM_pts = max(10, round(platM_area * PTS_PER_M2));
+P = [P; makeSurface([0, STEP_D*(N+1.5), N*STEP_H], STEP_W, STEP_D, platM_pts)];
 
-numPointsPlatform = ceil(STEP_W * STEP_D * pointsPerMeter2);
-x_platform = rand(numPointsPlatform, 1) * STEP_W;
-y_platform = platformYmin + rand(numPointsPlatform, 1) * (platformYmax - platformYmin);
-z_platform = ones(numPointsPlatform, 1) * platformZ;
-
-points = [points; x_platform, y_platform, z_platform];
-
-% Descending stairs (going down)
-startY = N * STEP_D + STEP_D;
-for i = 1:N
-    % Step surface
-    stepZ = (N-i+1) * STEP_H;
-    stepYmin = startY + (i-1) * STEP_D;
-    stepYmax = startY + i * STEP_D;
+%% 4. descending staircase (right side - going down)
+for j = 1:N
+    % Horizontal surface (step top)
+    step_top_area = STEP_W * STEP_D;
+    step_top_pts = max(10, round(step_top_area * PTS_PER_M2));
+    % Adjust position so first descending step's left edge aligns with platform's right edge
+    step_y = STEP_D*(N+1.5) + STEP_D/2 + STEP_D*j - STEP_D/2;  % Add STEP_D/2 offset
+    step_z = (N-j)*STEP_H;
+    P = [P; makeSurface([0, step_y, step_z], STEP_W, STEP_D, step_top_pts)];
     
-    % Generate points on step surface
-    numPointsStep = ceil(STEP_W * STEP_D * pointsPerMeter2);
-    x_step = rand(numPointsStep, 1) * STEP_W;
-    y_step = stepYmin + rand(numPointsStep, 1) * (stepYmax - stepYmin);
-    z_step = ones(numPointsStep, 1) * stepZ;
+    % Vertical surface (step riser) - connecting platform/previous step to current step
+    step_riser_area = STEP_W * STEP_H;
+    step_riser_pts = max(10, round(step_riser_area * PTS_PER_M2));
+    riser_y = step_y - STEP_D/2;  % Back of the step (connecting to previous level)
+    riser_x = (rand(step_riser_pts,1)-0.5)*STEP_W;    % X coordinates
+    riser_y_coords = repmat(riser_y, [step_riser_pts,1]);    % Y coordinates (fixed)
     
-    % Add to point cloud
-    points = [points; x_step, y_step, z_step];
-    
-    % Step riser (vertical face) - only if not the last step
-    if i < N
-        numPointsRiser = ceil(STEP_W * STEP_H * pointsPerMeter2 * 2);
-        x_riser = rand(numPointsRiser, 1) * STEP_W;
-        y_riser = ones(numPointsRiser, 1) * stepYmax;
-        z_riser = (N-i) * STEP_H + rand(numPointsRiser, 1) * STEP_H;
-        
-        points = [points; x_riser, y_riser, z_riser];
+    if j == 1
+        % First descending step: connect from high platform to first step
+        riser_z = step_z + rand(step_riser_pts,1)*STEP_H;  % From step height to platform height
+    else
+        % Other steps: connect from previous step to current step
+        prev_step_z = (N-(j-1))*STEP_H;
+        riser_z = step_z + rand(step_riser_pts,1)*(prev_step_z - step_z);  % From current to previous step height
     end
+    
+    riser_points = [riser_x, riser_y_coords, riser_z];  % n x 3 matrix
+    P = [P; riser_points];
 end
 
-% Add sensor noise
-noise = randn(size(points)) * NOISE;
-points = points + noise;
+%% 5. final ground platform
+% platF_area = STEP_W * STEP_D;
+% platF_pts = max(10, round(platF_area * PTS_PER_M2));
+% P = [P; makeSurface([0, STEP_D*(2*N+3)/2, 0], STEP_W, STEP_D, platF_pts)];
 
-% Create point cloud object
-pcd = pointCloud(points);
+%% 6. Add ceiling
+total_length = STEP_D * (2*N + 3);  % N up + N down + 3 platforms
+ceiling_area = STEP_W * total_length;
+ceiling_pts = max(10, round(ceiling_area * PTS_PER_M2));
+P = [P; makeSurface([0, total_length/2, CEILING_H], STEP_W, total_length, ceiling_pts)];
 
-fprintf('Generated point cloud with %d points\n', pcd.Count);
-fprintf('Point cloud bounds:\n');
-fprintf('  X: [%.2f, %.2f] m\n', min(points(:,1)), max(points(:,1)));
-fprintf('  Y: [%.2f, %.2f] m\n', min(points(:,2)), max(points(:,2)));
-fprintf('  Z: [%.2f, %.2f] m\n', min(points(:,3)), max(points(:,3)));
+%% Add noise and create pointCloud object
+P = P + NOISE*randn(size(P));
+pcd = pointCloud(P);
 
-% Visualize the generated scene
-figure('Name', 'Generated Stair Scene');
-pcshow(pcd);
-title('Synthetic Stair Point Cloud');
-xlabel('X (m)'); ylabel('Y (m)'); zlabel('Z (m)');
-view(45, 30);
-grid on; 
+% Visualize
+figure('Name', 'Stair Point Cloud');
+pcshow(pcd); 
+axis equal; 
+xlabel('X'); ylabel('Y'); zlabel('Z');
+title('Stair environment with surface points only');
+view(45, 30);  % Set view angle for better visualization
+
+%% Save to MAT for planner scripts
+save('simple_env.mat','pcd','STEP_W','STEP_H','STEP_D','N','CEILING_H');
+
+% --- Helper functions to sample surface points ---
+% Function to sample points on a rectangular surface
+function points = makeSurface(ctr, width, depth, n)
+    % Create n random points on the surface
+    x_coords = ctr(1) + (rand(n,1)-0.5)*width;     % X coordinates (n x 1)
+    y_coords = ctr(2) + (rand(n,1)-0.5)*depth;     % Y coordinates (n x 1)  
+    z_coords = repmat(ctr(3), [n,1]);              % Z coordinates (n x 1)
+    
+    % Concatenate horizontally to create n x 3 matrix
+    points = [x_coords, y_coords, z_coords];
+end 

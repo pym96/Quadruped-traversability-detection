@@ -43,7 +43,7 @@ classdef TomogramProcessor < handle
             obj.costParams.alpha_d = 0.2;    % Height adjustment cost factor (reduced)
             obj.costParams.theta_b = 15;     % Obstacle boundary threshold (increased)
             obj.costParams.theta_s = 1.0;    % Flat surface threshold (increased for slope tolerance)
-            obj.costParams.theta_p = 0.1;    % Safe neighbor ratio threshold (reduced for more permissive)
+            obj.costParams.theta_p = 0.05;    % Safe neighbor ratio threshold (reduced for more permissive)
             obj.costParams.alpha_s = 0.05;   % Surface cost factor (reduced)
             obj.costParams.alpha_b = 0.05;   % Boundary cost factor (reduced)
             obj.costParams.r_g = 0.15;       % Grid resolution
@@ -63,7 +63,7 @@ classdef TomogramProcessor < handle
             % Load point cloud data and initialize parameters
             obj.pointCloud = points;
             rawZmin = min(points(:,3));
-            obj.zMin = floor(rawZmin / obj.ds) * obj.ds - obj.ds/2;  % align to nearest slice plane
+            obj.zMin = floor(rawZmin / obj.ds) * obj.ds - 0.10;  % align to nearest slice plane
             obj.zMax = max(points(:,3));
             obj.N = ceil((obj.zMax - obj.zMin) / obj.ds);  % number of slices
             
@@ -136,11 +136,15 @@ classdef TomogramProcessor < handle
                     slice = obj.slices{k+1};
                     slice_z = obj.zMin + k * obj.ds;
                     
-                    % If point is below or at slice height, update ground (max)
-                    if z <= slice_z
+                    % CRITICAL FIX: Only assign ground points that are reasonably close to slice height
+                    % This prevents distant ground points from creating "floating" traversable areas
+                    max_ground_distance = 1.0 * obj.ds;  % 1.0 * ds = 0.2m maximum distance
+                    
+                    % If point is below or at slice height AND within reasonable distance
+                    if z <= slice_z && (slice_z - z) <= max_ground_distance
                         slice.eG(i,j) = max(z, slice.eG(i,j));
                     % If point is above slice height, update ceiling (min)
-                    else
+                    elseif z > slice_z
                         slice.eC(i,j) = min(z, slice.eC(i,j));
                     end
                     
@@ -347,7 +351,7 @@ classdef TomogramProcessor < handle
             cI(maskHigh) = 0;                 % 净空充足 → 0
             % Fuse costs: if either component hits barrier, keep barrier;
             % otherwise take weighted sum favouring ground cost.
-            cInit = max(cI, 0.5*cI + 0.5*cG);
+            cInit = max(cI, 0.4*cI + 0.6*cG);
             cT = min(obj.costParams.c_B, cInit);
 
             % -----------------------------------------------------------------
@@ -358,7 +362,7 @@ classdef TomogramProcessor < handle
             % as blue patches in the visualization.
             % -----------------------------------------------------------------
             supportMap = slice.z - slice.eG;          % vertical distance to ground
-            farSupportMask = supportMap > 3.5*obj.ds;    % out of supporting range (extreme jump capability)
+            farSupportMask = supportMap > 2 * obj.ds;    % increased for stair climbing (0.6m)
             cT(farSupportMask) = NaN;
             cI(farSupportMask) = NaN;
             cG(farSupportMask) = NaN;
@@ -369,23 +373,34 @@ classdef TomogramProcessor < handle
             % Calculate ground-based cost
             [rows, cols] = size(eG);
             cG = nan(rows, cols);
-            cG(isnan(eG)) = obj.costParams.c_B;
             
             % Calculate gradients
             [gx, gy] = obj.calculateGradients(eG);
             mxy = max(abs(gx), abs(gy));
             mgrad = sqrt(gx.^2 + gy.^2);
             
-            % Initialize gradient cost to barrier for invalid cells
-            cG(:) = obj.costParams.c_B;
+            % Initialize all costs to zero, set barriers only for invalid cells
+            cG = zeros(rows, cols);
+            cG(isnan(eG)) = obj.costParams.c_B;
             
-            for i = 2:rows-1
-                for j = 2:cols-1
+            % Process ALL valid cells, not just interior ones
+            for i = 1:rows
+                for j = 1:cols
                     if ~isnan(eG(i,j))
-                        if mgrad(i,j) < obj.costParams.theta_s
+                        % Check if we have valid gradient at this position
+                        if mgrad(i,j) == 0 && (i == 1 || i == rows || j == 1 || j == cols)
+                            % Boundary cell with no gradient - use moderate cost
+                            cG(i,j) = obj.costParams.alpha_s * 0.1; % Small constant cost for boundaries
+                        elseif mgrad(i,j) < obj.costParams.theta_s
                             cG(i,j) = obj.costParams.alpha_s * (mgrad(i,j) / obj.costParams.theta_s^2);
                         else
-                            patch = mgrad(i-1:i+1, j-1:j+1);
+                            % For neighbor analysis, ensure we don't go out of bounds
+                            i_min = max(1, i-1);
+                            i_max = min(rows, i+1);
+                            j_min = max(1, j-1);
+                            j_max = min(cols, j+1);
+                            
+                            patch = mgrad(i_min:i_max, j_min:j_max);
                             valid_patch = ~isnan(patch);
                             if any(valid_patch(:))
                                 ps = sum(patch(:) < obj.costParams.theta_s & valid_patch(:)) / sum(valid_patch(:));
@@ -396,6 +411,9 @@ classdef TomogramProcessor < handle
                                 else
                                     cG(i,j) = obj.costParams.c_B;
                                 end
+                            else
+                                % No valid neighbors - use moderate cost instead of barrier
+                                cG(i,j) = obj.costParams.alpha_s * 0.5;
                             end
                         end
                     end
@@ -773,10 +791,11 @@ classdef TomogramProcessor < handle
             for k = 1:length(obj.slices)
                 slice = obj.slices{k};
                 if z >= slice.z - obj.ds/2 && z <= slice.z + obj.ds/2
-                    sliceIdx = k;
+                    sliceIdx = k;  % Return 1-based slice index for MATLAB
                     return;
                 end
             end
+            % If no slice found, return 0
         end
         
         function neighbors = getNeighborsWithGateways(obj, node)
@@ -886,7 +905,7 @@ classdef TomogramProcessor < handle
             end
             
             % Check if connection breaks (c^N = c^B)
-            if node_cost >= obj.costParams.c_B
+            if node_cost > obj.costParams.c_B
                 cost = inf;
                 return;
             end
@@ -942,7 +961,7 @@ classdef TomogramProcessor < handle
             slice = obj.slices{k};
             
             % Check basic traversability cost
-            if isnan(slice.cT(i,j)) || slice.cT(i,j) >= obj.costParams.c_B
+            if isnan(slice.cT(i,j)) || slice.cT(i,j) > obj.costParams.c_B
                 valid = false;
                 return;
             end
@@ -964,7 +983,7 @@ classdef TomogramProcessor < handle
             
             % Additional check for support
             support = slice.z - slice.eG(i,j);
-            if support > 3.5*obj.ds
+            if support > 3.5*obj.ds  % 0.7m
                 valid = false;
                 return;
             end
@@ -1594,7 +1613,7 @@ classdef TomogramProcessor < handle
             
             % Check support distance
             support = slice.z - eG;
-                             supportThreshold = 3.5 * obj.ds;
+            supportThreshold = 1.4 * obj.ds;
             fprintf('  Support distance: %.3fm\n', support);
             fprintf('  Support threshold: %.3fm\n', supportThreshold);
             
